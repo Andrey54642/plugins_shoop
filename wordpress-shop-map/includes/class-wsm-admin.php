@@ -1,1 +1,790 @@
-<?phpif ( ! defined( 'ABSPATH' ) ) {	exit;}class WSM_Admin {	private WSM_Plugin $plugin;	private ?WSM_Importer $importer = null;	public function __construct( WSM_Plugin $plugin ) {		$this->plugin = $plugin;		add_action( 'admin_menu', array( $this, 'register_menu' ) );		add_action( 'add_meta_boxes', array( $this, 'register_meta_boxes' ) );		add_action( 'save_post_' . WSM_Plugin::STORE_POST_TYPE, array( $this, 'save_store' ), 10, 2 );		add_action( 'save_post_page', array( $this, 'save_page_override' ), 10, 2 );		add_action( 'manage_' . WSM_Plugin::STORE_POST_TYPE . '_posts_columns', array( $this, 'register_store_columns' ) );		add_action( 'manage_' . WSM_Plugin::STORE_POST_TYPE . '_posts_custom_column', array( $this, 'render_store_columns' ), 10, 2 );		add_action( 'admin_post_wsm_save_settings', array( $this, 'save_settings' ) );		add_action( 'admin_post_wsm_import_stores', array( $this, 'handle_import' ) );		add_action( 'admin_notices', array( $this, 'render_admin_notices' ) );	}	public function register_menu(): void {		add_submenu_page(			'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE,			'Настройки карты магазинов',			'Настройки',			'manage_options',			'wsm-settings',			array( $this, 'render_settings_page' )		);		add_submenu_page(			'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE,			'Импорт магазинов из Excel',			'Импорт Excel',			'manage_options',			'wsm-import',			array( $this, 'render_import_page' )		);		add_submenu_page(			'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE,			'Справка по шорткодам',			'Шорткоды',			'manage_options',			'wsm-shortcodes',			array( $this, 'render_shortcodes_page' )		);	}	private function get_section_url( string $page_slug, array $query_args = array() ): string {		$url = admin_url( 'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE . '&page=' . $page_slug );		if ( ! empty( $query_args ) ) {			$url = add_query_arg( $query_args, $url );		}		return $url;	}	private function render_section_navigation( string $active_slug ): void {		$tabs = array(			'wsm-settings'   => 'Настройки',			'wsm-import'     => 'Импорт Excel',			'wsm-shortcodes' => 'Шорткоды',		);		echo '<nav class="nav-tab-wrapper" style="margin-top:12px;">';		foreach ( $tabs as $slug => $label ) {			$class = 'nav-tab' . ( $slug === $active_slug ? ' nav-tab-active' : '' );			echo '<a class="' . esc_attr( $class ) . '" href="' . esc_url( $this->get_section_url( $slug ) ) . '">' . esc_html( $label ) . '</a>';		}		echo '</nav>';	}	public function register_meta_boxes(): void {		add_meta_box(			'wsm_store_details',			'Данные магазина',			array( $this, 'render_store_meta_box' ),			WSM_Plugin::STORE_POST_TYPE,			'normal',			'high'		);		add_meta_box(			'wsm_store_status',			'Статус отображения',			array( $this, 'render_store_status_meta_box' ),			WSM_Plugin::STORE_POST_TYPE,			'side',			'high'		);		add_meta_box(			'wsm_page_override',			'URL кнопки для карты магазинов',			array( $this, 'render_page_override_meta_box' ),			'page',			'side',			'default'		);	}	public function register_store_columns( array $columns ): array {		$columns['wsm_city']        = 'Город';		$columns['wsm_brands']      = 'Бренды';		$columns['wsm_coordinates'] = 'Координаты';		$columns['wsm_status']      = 'Статус';		return $columns;	}	public function render_store_columns( string $column, int $post_id ): void {		switch ( $column ) {			case 'wsm_city':				echo esc_html( $this->plugin->get_store_city( $post_id ) ?: '—' );				break;			case 'wsm_brands':				$brand_names = array();				foreach ( $this->plugin->get_store_brand_slugs( $post_id ) as $slug ) {					$brand = $this->plugin->get_brand_data_by_slug( $slug );					if ( ! empty( $brand['name'] ) ) {						$brand_names[] = (string) $brand['name'];					}				}				echo esc_html( ! empty( $brand_names ) ? implode( ', ', $brand_names ) : '—' );				break;			case 'wsm_coordinates':				$coords = $this->plugin->get_store_coordinates( $post_id );				echo ( '' !== $coords['lat'] && '' !== $coords['lng'] ) ? esc_html( $coords['lat'] . ', ' . $coords['lng'] ) : '&mdash;';				break;			case 'wsm_status':				$errors = $this->get_store_status_messages( $post_id );				echo '' !== $errors ? '<span style="color:#b32d2e;">' . esc_html( $errors ) . '</span>' : '<span style="color:#1d7f3f;">Готово</span>';				break;		}	}	// Debug helpers removed to keep admin rendering minimal and avoid accidental output issues.	public function render_store_meta_box( WP_Post $post ): void {		wp_nonce_field( 'wsm_save_store', 'wsm_store_nonce' );		$address           = $this->plugin->get_store_address( (int) $post->ID );		$city              = $this->plugin->get_store_city( (int) $post->ID );		$city_slug         = $this->plugin->normalize_city_slug( $city );		$lat               = $this->plugin->get_store_coordinates( (int) $post->ID )['lat'];		$lng               = $this->plugin->get_store_coordinates( (int) $post->ID )['lng'];		$current_brand_slugs = $this->plugin->get_store_brand_slugs( (int) $post->ID );		$validation_errors = $this->plugin->get_store_validation_errors( (int) $post->ID );		$geocode_error     = $this->plugin->get_store_geocode_error( (int) $post->ID );		$yandex_api_key    = $this->plugin->get_yandex_api_key();		$brand_data        = $this->plugin->get_brand_data();		$cities = $this->plugin->get_existing_city_names();		?>		<div class="wsm-admin-metabox">			<p>				<label for="wsm_address"><strong>Адрес</strong></label><br>				<input type="text" class="widefat" id="wsm_address" name="wsm_address" value="<?php echo esc_attr( $address ); ?>" placeholder="Москва, Тверская улица, 1">			</p>			<p>				<label for="wsm_city"><strong>Город</strong></label><br>				<input type="text" class="widefat" list="wsm_city_list" id="wsm_city" name="wsm_city" value="<?php echo esc_attr( $city ); ?>" placeholder="Москва">				<datalist id="wsm_city_list">					<?php foreach ( $cities as $city_name ) : ?>						<option value="<?php echo esc_attr( $city_name ); ?>"></option>					<?php endforeach; ?>				</datalist>			</p>			<p>				<strong>Бренды</strong><br>				<?php foreach ( $brand_data as $brand ) : ?>					<label style="display:flex;align-items:center;gap:10px;margin:0 0 10px;">						<input type="checkbox" name="wsm_brand_slugs[]" value="<?php echo esc_attr( $brand['slug'] ); ?>" <?php checked( in_array( $brand['slug'], $current_brand_slugs, true ) ); ?>>						<span style="display:inline-flex;align-items:center;gap:8px;">							<span style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border-radius:8px;background:#f0f0f1;overflow:hidden;flex:0 0 28px;">								<?php if ( ! empty( $brand['logo_url'] ) ) : ?>									<img src="<?php echo esc_url( $brand['logo_url'] ); ?>" alt="<?php echo esc_attr( $brand['name'] ); ?>" style="max-width:100%;max-height:100%;object-fit:contain;">								<?php else : ?>									<span aria-hidden="true">&bull;</span>								<?php endif; ?>							</span>							<strong><?php echo esc_html( $brand['name'] ); ?></strong>						</span>					</label>				<?php endforeach; ?>				<span class="description">Можно выбрать несколько брендов.</span>			</p>			<p>				<label for="wsm_latitude"><strong>Широта</strong></label><br>				<input type="text" class="regular-text" id="wsm_latitude" name="wsm_latitude" value="<?php echo esc_attr( $lat ); ?>" placeholder="55.7558">				<label for="wsm_longitude" style="margin-left:12px;"><strong>Долгота</strong></label>				<input type="text" class="regular-text" id="wsm_longitude" name="wsm_longitude" value="<?php echo esc_attr( $lng ); ?>" placeholder="37.6173">			</p>			<p class="description">Если координаты пусты, плагин попробует получить их через Яндекс.Геокодер при сохранении. Без API-ключа можно заполнить широту и долготу вручную.</p>		<?php if ( '' !== $validation_errors ) : ?>			<div style="padding:10px 12px;border-left:4px solid #d63638;background:#fcf0f1;margin:12px 0;">				<strong>Проблемы с данными:</strong>				<div style="white-space:pre-wrap;">&nbsp;<?php echo esc_html( $validation_errors ); ?></div>			</div>		<?php endif; ?>			<?php if ( '' !== $geocode_error ) : ?>				<div style="padding:10px 12px;border-left:4px solid #d63638;background:#fcf0f1;margin:12px 0;">					<strong>Ошибка геокодирования:</strong>					<p style="margin:8px 0 0;"><?php echo esc_html( $geocode_error ); ?></p>				</div>			<?php elseif ( '' === $yandex_api_key ) : ?>				<div style="padding:10px 12px;border-left:4px solid #dba617;background:#fff8e5;margin:12px 0;">					<strong>Автогеокодирование выключено:</strong>					<p style="margin:8px 0 0;">Не задан API-ключ Яндекс.Карт. Укажите координаты вручную или добавьте ключ в настройках плагина.</p>				</div>			<?php endif; ?>			<?php if ( '' !== $validation_errors ) : ?>				<div style="padding:10px 12px;border-left:4px solid #d63638;background:#fcf0f1;margin:12px 0;">					<strong>Почему магазин не показывается:</strong>					<p style="margin:8px 0 0;">Этот магазин сохранён с ошибками и может не попасть на карту. Проверьте сообщения выше и сохраните запись заново.</p>				</div>			<?php endif; ?>		</div>		<?php	}	public function render_page_override_meta_box( WP_Post $post ): void {		wp_nonce_field( 'wsm_save_page_override', 'wsm_page_override_nonce' );		$value = (string) get_post_meta( $post->ID, WSM_Plugin::PAGE_META_OVERRIDE_URL, true );		?>		<p>			<label for="wsm_button_url_override"><strong>URL кнопки</strong></label><br>			<input type="url" class="widefat" id="wsm_button_url_override" name="wsm_button_url_override" value="<?php echo esc_attr( $value ); ?>" placeholder="https://example.com/buy">		</p>		<p class="description">Если URL указан, кнопки в виджете будут вести на него, а текст изменится на «Купить».</p>		<?php	}	public function save_store( int $post_id, WP_Post $post ): void {		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {			return;		}		if ( wp_is_post_revision( $post_id ) ) {			return;		}		if ( ! isset( $_POST['wsm_store_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_store_nonce'] ) ), 'wsm_save_store' ) ) {			return;		}		if ( ! current_user_can( 'edit_post', $post_id ) ) {			return;		}		$errors = array();		$title  = isset( $_POST['post_title'] ) ? sanitize_text_field( wp_unslash( $_POST['post_title'] ) ) : get_the_title( $post_id );		$address = isset( $_POST['wsm_address'] ) ? sanitize_text_field( wp_unslash( $_POST['wsm_address'] ) ) : '';		$city    = isset( $_POST['wsm_city'] ) ? sanitize_text_field( wp_unslash( $_POST['wsm_city'] ) ) : '';		$brand_slugs = isset( $_POST['wsm_brand_slugs'] ) && is_array( $_POST['wsm_brand_slugs'] ) ? WSM_Plugin::normalize_store_brand_slugs( wp_unslash( $_POST['wsm_brand_slugs'] ) ) : array();		$lat     = isset( $_POST['wsm_latitude'] ) ? WSM_Plugin::sanitize_float( wp_unslash( $_POST['wsm_latitude'] ) ) : '';		$lng     = isset( $_POST['wsm_longitude'] ) ? WSM_Plugin::sanitize_float( wp_unslash( $_POST['wsm_longitude'] ) ) : '';		if ( '' === trim( $title ) ) {			$errors[] = 'Укажите название магазина.';		}		if ( '' === trim( $address ) ) {			$errors[] = 'Укажите адрес.';		}		if ( '' === trim( $city ) ) {			$errors[] = 'Укажите город.';		}		if ( empty( $brand_slugs ) ) {			$errors[] = 'Выберите хотя бы один бренд.';		}		update_post_meta( $post_id, WSM_Plugin::STORE_META_ADDRESS, $address );		update_post_meta( $post_id, WSM_Plugin::STORE_META_CITY, $city );		update_post_meta( $post_id, WSM_Plugin::STORE_META_BRAND_SLUGS, $brand_slugs );		$coordinates_saved = false;		$geocode_error     = '';		if ( '' !== $lat && '' !== $lng ) {			update_post_meta( $post_id, WSM_Plugin::STORE_META_LAT, $lat );			update_post_meta( $post_id, WSM_Plugin::STORE_META_LNG, $lng );			delete_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR );			$coordinates_saved = true;		} elseif ( '' !== $city && '' !== $address ) {			$result = $this->plugin->geocode_address( $city, $address );			if ( is_wp_error( $result ) ) {				$geocode_error = $result->get_error_message();				delete_post_meta( $post_id, WSM_Plugin::STORE_META_LAT );				delete_post_meta( $post_id, WSM_Plugin::STORE_META_LNG );				update_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR, $geocode_error );			} else {				update_post_meta( $post_id, WSM_Plugin::STORE_META_LAT, (string) $result['lat'] );				update_post_meta( $post_id, WSM_Plugin::STORE_META_LNG, (string) $result['lng'] );				delete_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR );				$coordinates_saved = true;			}		} else {			delete_post_meta( $post_id, WSM_Plugin::STORE_META_LAT );			delete_post_meta( $post_id, WSM_Plugin::STORE_META_LNG );			delete_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR );		}		if ( ! $coordinates_saved ) {			$errors[] = '' !== $geocode_error ? $geocode_error : 'Укажите координаты вручную или настройте автогеокодирование.';		}		if ( ! empty( $errors ) ) {			update_post_meta( $post_id, WSM_Plugin::STORE_META_VALIDATION_ERRORS, implode( "\n", array_unique( $errors ) ) );		} else {			delete_post_meta( $post_id, WSM_Plugin::STORE_META_VALIDATION_ERRORS );		}		update_post_meta( $post_id, '_wsm_store_save_ok', '1' );	}	public function save_page_override( int $post_id, WP_Post $post ): void {		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {			return;		}		if ( wp_is_post_revision( $post_id ) ) {			return;		}		if ( ! isset( $_POST['wsm_page_override_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_page_override_nonce'] ) ), 'wsm_save_page_override' ) ) {			return;		}		if ( ! current_user_can( 'edit_post', $post_id ) ) {			return;		}		$url = isset( $_POST['wsm_button_url_override'] ) ? WSM_Plugin::sanitize_http_url( wp_unslash( $_POST['wsm_button_url_override'] ) ) : '';		if ( '' !== $url ) {			update_post_meta( $post_id, WSM_Plugin::PAGE_META_OVERRIDE_URL, $url );		} else {			delete_post_meta( $post_id, WSM_Plugin::PAGE_META_OVERRIDE_URL );		}	}	public function render_settings_page(): void {		if ( ! current_user_can( 'manage_options' ) ) {			wp_die( 'Недостаточно прав для доступа к этой странице.' );		}		$brands   = $this->plugin->get_brand_data();		$settings = $this->plugin->get_settings();		$key      = isset( $settings['yandex_api_key'] ) ? (string) $settings['yandex_api_key'] : '';		?>		<div class="wrap">			<h1>Настройки карты магазинов</h1>			<?php $this->render_section_navigation( 'wsm-settings' ); ?>			<?php if ( isset( $_GET['wsm_saved'] ) ) : ?>				<div class="notice notice-success is-dismissible"><p>Настройки сохранены.</p></div>			<?php endif; ?>			<?php if ( isset( $_GET['wsm_invalid_urls'] ) ) : ?>				<div class="notice notice-warning is-dismissible"><p>Часть URL была сброшена, потому что она не прошла проверку HTTP/HTTPS.</p></div>			<?php endif; ?>			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">				<?php wp_nonce_field( 'wsm_save_settings', 'wsm_settings_nonce' ); ?>				<input type="hidden" name="action" value="wsm_save_settings">				<table class="form-table" role="presentation">					<tr>						<th scope="row"><label for="wsm_yandex_api_key">API-ключ Яндекс.Карт</label></th>						<td>							<input type="text" class="regular-text" id="wsm_yandex_api_key" name="wsm_yandex_api_key" value="<?php echo esc_attr( $key ); ?>">							<p class="description">Используется для загрузки карты и автогеокодирования адресов. Без ключа карта покажет fallback-сообщение.</p>						</td>					</tr>				</table>				<h2>Бренды</h2>				<p class="description">В плагине всегда есть ровно 3 фиксированных бренда. Здесь можно изменить названия, логотипы и URL кнопки. Добавление и удаление брендов через UI не предусмотрено.</p>				<table class="widefat striped">					<thead>						<tr>							<th>Бренд</th>							<th>Логотип URL</th>							<th>Default URL кнопки</th>						</tr>					</thead>					<tbody>						<?php foreach ( $brands as $brand ) : ?>							<tr>								<td>									<strong><?php echo esc_html( $brand['slug'] ); ?></strong>									<input type="text" class="widefat" name="wsm_brand[<?php echo esc_attr( $brand['slug'] ); ?>][name]" value="<?php echo esc_attr( $brand['name'] ); ?>" style="margin-top:6px;">								</td>								<td>									<input type="url" class="widefat" name="wsm_brand[<?php echo esc_attr( $brand['slug'] ); ?>][logo_url]" value="<?php echo esc_attr( $brand['logo_url'] ); ?>" placeholder="https://example.com/logo.png">								</td>								<td>									<input type="url" class="widefat" name="wsm_brand[<?php echo esc_attr( $brand['slug'] ); ?>][default_url]" value="<?php echo esc_attr( $brand['default_url'] ); ?>" placeholder="https://example.com/brand">								</td>							</tr>						<?php endforeach; ?>					</tbody>				</table>				<?php submit_button( 'Сохранить настройки' ); ?>			</form>		</div>		<?php	}	public function render_import_page(): void {		if ( ! current_user_can( 'manage_options' ) ) {			wp_die( 'Недостаточно прав для доступа к этой странице.' );		}		$import_result = $this->get_import_result_from_request();		?>		<div class="wrap">			<h1>Импорт магазинов из Excel</h1>			<?php $this->render_section_navigation( 'wsm-import' ); ?>			<p class="description">Поддерживаются файлы <code>.xls</code> и <code>.xlsx</code>. Первый непустой лист используется для импорта, первая непустая строка считается заголовком.</p>			<?php if ( is_array( $import_result ) ) : ?>				<?php $this->render_import_result( $import_result ); ?>			<?php endif; ?>			<h2>Какие колонки нужны</h2>			<table class="widefat striped">				<thead>					<tr>						<th>Поле</th>						<th>Обязательно</th>						<th>Допустимые заголовки</th>						<th>Примечание</th>					</tr>				</thead>				<tbody>					<tr>						<td><code>title</code></td>						<td>Да</td>						<td><code>title</code>, <code>name</code>, <code>название</code>, <code>наименование</code>, <code>магазин</code></td>						<td>Используется для поиска существующего магазина, если не указан <code>external_id</code>.</td>					</tr>					<tr>						<td><code>city</code></td>						<td>Да</td>						<td><code>city</code>, <code>город</code></td>						<td>Город магазина.</td>					</tr>					<tr>						<td><code>address</code></td>						<td>Да</td>						<td><code>address</code>, <code>адрес</code></td>						<td>Адрес магазина.</td>					</tr>					<tr>						<td><code>brands</code></td>						<td>Да</td>						<td><code>brands</code>, <code>brand</code>, <code>brand_slugs</code>, <code>brand_slug</code>, <code>бренды</code>, <code>бренд</code></td>						<td>Можно перечислять несколько брендов через запятую, точку с запятой, вертикальную черту или перенос строки.</td>					</tr>					<tr>						<td><code>lat</code></td>						<td>Нет</td>						<td><code>lat</code>, <code>latitude</code>, <code>широта</code></td>						<td>Если пусто, плагин попробует геокодировать адрес.</td>					</tr>					<tr>						<td><code>lng</code></td>						<td>Нет</td>						<td><code>lng</code>, <code>lon</code>, <code>long</code>, <code>longitude</code>, <code>долгота</code></td>						<td>Если пусто, плагин попробует геокодировать адрес.</td>					</tr>					<tr>						<td><code>external_id</code></td>						<td>Нет</td>						<td><code>external_id</code>, <code>id</code>, <code>externalid</code>, <code>код</code>, <code>артикул</code></td>						<td>Рекомендуется, если в файле могут повторяться названия магазинов. По нему импорт обновляет записи однозначно.</td>					</tr>				</tbody>			</table>			<p class="description">Если у нескольких строк одинаковое название и <code>external_id</code> пустой, импорт остановится на неоднозначном совпадении и попросит добавить идентификатор.</p>			<h2>Загрузить файл</h2>			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" enctype="multipart/form-data">				<?php wp_nonce_field( 'wsm_import_stores', 'wsm_import_nonce' ); ?>				<input type="hidden" name="action" value="wsm_import_stores">				<table class="form-table" role="presentation">					<tr>						<th scope="row"><label for="wsm_import_file">Файл Excel</label></th>						<td>							<input type="file" id="wsm_import_file" name="wsm_import_file" accept=".xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">							<p class="description">Импорт создаёт или обновляет магазины в CPT <code>sm_store</code>, сохраняет бренды, адрес и координаты, а при необходимости пытается геокодировать адрес.</p>						</td>					</tr>				</table>				<?php submit_button( 'Запустить импорт' ); ?>			</form>		</div>		<?php	}	public function render_shortcodes_page(): void {		if ( ! current_user_can( 'manage_options' ) ) {			wp_die( 'Недостаточно прав для доступа к этой странице.' );		}		?>		<div class="wrap">			<h1>Шорткоды</h1>			<?php $this->render_section_navigation( 'wsm-shortcodes' ); ?>			<p class="description">В плагине сейчас один основной шорткод. Он работает на любой странице WordPress.</p>			<table class="widefat striped">				<thead>					<tr>						<th>Шорткод</th>						<th>Параметры</th>						<th>Что делает</th>					</tr>				</thead>				<tbody>					<tr>						<td><code>[stores_map]</code></td>						<td><code>button_url</code> - необязательный URL внешней кнопки</td>						<td>Показывает карту, список магазинов и карточки брендов. Если <code>button_url</code> задан, все CTA в этом встраивании ведут на него, а текст меняется на <code>Купить</code>.</td>					</tr>				</tbody>			</table>			<h2>Приоритет URL кнопки</h2>			<ol>				<li>Параметр шорткода <code>button_url</code></li>				<li>URL кнопки в метабоксе страницы <code>URL кнопки для карты магазинов</code></li>				<li>Default URL бренда в <code>Магазины -> Настройки</code></li>			</ol>			<h2>Примеры</h2>			<pre><code>[stores_map]</code></pre>			<pre><code>[stores_map button_url="https://example.com/buy"]</code></pre>		</div>		<?php	}	public function save_settings(): void {		if ( ! current_user_can( 'manage_options' ) ) {			wp_die( 'Недостаточно прав для сохранения настроек.' );		}		if ( ! isset( $_POST['wsm_settings_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_settings_nonce'] ) ), 'wsm_save_settings' ) ) {			wp_die( 'Неверный nonce.' );		}		$settings = $this->plugin->get_settings();		$settings['yandex_api_key'] = isset( $_POST['wsm_yandex_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['wsm_yandex_api_key'] ) ) : '';		$brands_input = isset( $_POST['wsm_brand'] ) && is_array( $_POST['wsm_brand'] ) ? wp_unslash( $_POST['wsm_brand'] ) : array();		$invalid_url_detected = false;		foreach ( $this->plugin->get_brand_data() as $brand ) {			$slug = (string) $brand['slug'];			$row  = isset( $brands_input[ $slug ] ) && is_array( $brands_input[ $slug ] ) ? $brands_input[ $slug ] : array();			$name        = isset( $row['name'] ) ? sanitize_text_field( (string) $row['name'] ) : (string) $brand['name'];			$logo_url    = isset( $row['logo_url'] ) ? WSM_Plugin::sanitize_http_url( (string) $row['logo_url'] ) : '';			$default_url = isset( $row['default_url'] ) ? WSM_Plugin::sanitize_http_url( (string) $row['default_url'] ) : '';			if ( '' !== (string) ( $row['logo_url'] ?? '' ) && '' === $logo_url ) {				$invalid_url_detected = true;			}			if ( '' !== (string) ( $row['default_url'] ?? '' ) && '' === $default_url ) {				$invalid_url_detected = true;			}			$settings['brands'][ $slug ] = array(				'name'        => '' !== trim( $name ) ? $name : (string) $brand['name'],				'logo_url'    => $logo_url,				'default_url' => $default_url,			);		}		update_option( WSM_Plugin::OPTION_KEY, WSM_Plugin::normalize_settings( $settings ), false );		$query_args = array(			'wsm_saved' => 1,		);		if ( $invalid_url_detected ) {			$query_args['wsm_invalid_urls'] = 1;		}		wp_safe_redirect( $this->get_section_url( 'wsm-settings', $query_args ) );		exit;	}	public function handle_import(): void {		if ( ! current_user_can( 'manage_options' ) ) {			wp_die( 'Недостаточно прав для импорта.' );		}		if ( ! isset( $_POST['wsm_import_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_import_nonce'] ) ), 'wsm_import_stores' ) ) {			wp_die( 'Неверный nonce.' );		}		$file = isset( $_FILES['wsm_import_file'] ) && is_array( $_FILES['wsm_import_file'] ) ? $_FILES['wsm_import_file'] : array();		try {			$import_result = $this->get_importer()->import_uploaded_file( $file );		} catch ( Throwable $exception ) {			$import_result = new WP_Error( 'wsm_import_exception', $exception->getMessage() );		}		if ( is_wp_error( $import_result ) ) {			$result = array(				'file_name'     => isset( $file['name'] ) ? (string) $file['name'] : '',				'file_type'     => '',				'sheet_name'    => '',				'rows_seen'     => 0,				'rows_imported' => 0,				'created'       => 0,				'updated'       => 0,				'skipped'       => 0,				'warnings'      => array(),				'errors'        => array( $import_result->get_error_message() ),				'header_map'    => array(),				'required_keys' => array( 'title', 'city', 'address', 'brands' ),				'import_status' => 'error',			);		} else {			$result = $import_result;		}		$token = wp_generate_password( 12, false, false );		set_transient( $this->get_import_result_transient_key( $token ), $result, 10 * MINUTE_IN_SECONDS );		wp_safe_redirect( $this->get_section_url( 'wsm-import', array( 'wsm_import_token' => $token ) ) );		exit;	}	public function render_admin_notices(): void {		$current_screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;		if ( ! $current_screen || WSM_Plugin::STORE_POST_TYPE !== $current_screen->post_type ) {			return;		}		if ( ! isset( $_GET['post'] ) ) {			return;		}		$post_id = absint( $_GET['post'] );		if ( ! $post_id ) {			return;		}		$geocode_error = $this->plugin->get_store_geocode_error( $post_id );		if ( '' !== $geocode_error ) {			echo '<div class="notice notice-error is-dismissible"><p><strong>Магазин:</strong> ' . esc_html( $geocode_error ) . '</p></div>';		}	}	private function get_importer(): WSM_Importer {		if ( null === $this->importer ) {			$this->importer = new WSM_Importer( $this->plugin );		}		return $this->importer;	}	private function get_import_result_transient_key( string $token ): string {		return 'wsm_import_result_' . sanitize_key( $token );	}	private function get_import_result_from_request(): ?array {		if ( ! isset( $_GET['wsm_import_token'] ) ) {			return null;		}		$token = sanitize_key( (string) wp_unslash( $_GET['wsm_import_token'] ) );		if ( '' === $token ) {			return null;		}		$result = get_transient( $this->get_import_result_transient_key( $token ) );		if ( ! is_array( $result ) ) {			return null;		}		delete_transient( $this->get_import_result_transient_key( $token ) );		return $result;	}	private function render_import_result( array $result ): void {		$status = isset( $result['import_status'] ) ? (string) $result['import_status'] : 'success';		$class  = 'success';		$title  = 'Импорт завершён.';		if ( 'warning' === $status ) {			$class = 'warning';			$title = 'Импорт завершён с предупреждениями.';		} elseif ( 'error' === $status ) {			$class = 'error';			$title = 'Импорт не выполнен.';		}		$labels = array(			'title'       => 'Название',			'city'        => 'Город',			'address'     => 'Адрес',			'brands'      => 'Бренды',			'lat'         => 'Широта',			'lng'         => 'Долгота',			'external_id' => 'external_id',		);		?>		<div class="notice notice-<?php echo esc_attr( $class ); ?> is-dismissible">			<p><strong><?php echo esc_html( $title ); ?></strong></p>			<ul style="margin:0 0 0 18px;list-style:disc;">				<li><?php echo esc_html( 'Файл: ' . (string) ( $result['file_name'] ?? '—' ) ); ?></li>				<li><?php echo esc_html( 'Лист: ' . (string) ( $result['sheet_name'] ?? '—' ) ); ?></li>				<li><?php echo esc_html( 'Строк обработано: ' . (string) ( $result['rows_seen'] ?? 0 ) ); ?></li>				<li><?php echo esc_html( 'Импортировано: ' . (string) ( $result['rows_imported'] ?? 0 ) ); ?></li>				<li><?php echo esc_html( 'Создано: ' . (string) ( $result['created'] ?? 0 ) ); ?></li>				<li><?php echo esc_html( 'Обновлено: ' . (string) ( $result['updated'] ?? 0 ) ); ?></li>				<li><?php echo esc_html( 'Пропущено: ' . (string) ( $result['skipped'] ?? 0 ) ); ?></li>			</ul>			<?php if ( ! empty( $result['header_map'] ) && is_array( $result['header_map'] ) ) : ?>				<p><strong>Сопоставление колонок:</strong></p>				<table class="widefat striped" style="max-width:760px;">					<thead>						<tr>							<th>Поле</th>							<th>Заголовок в файле</th>						</tr>					</thead>					<tbody>						<?php foreach ( $result['header_map'] as $field => $meta ) : ?>							<tr>								<td><?php echo esc_html( $labels[ $field ] ?? (string) $field ); ?></td>								<td><code><?php echo esc_html( (string) ( $meta['header'] ?? '' ) ); ?></code></td>							</tr>						<?php endforeach; ?>					</tbody>				</table>			<?php endif; ?>			<?php if ( ! empty( $result['warnings'] ) && is_array( $result['warnings'] ) ) : ?>				<p><strong>Предупреждения:</strong></p>				<ul style="margin:0 0 0 18px;list-style:disc;">					<?php foreach ( $result['warnings'] as $message ) : ?>						<li><?php echo esc_html( (string) $message ); ?></li>					<?php endforeach; ?>				</ul>			<?php endif; ?>			<?php if ( ! empty( $result['errors'] ) && is_array( $result['errors'] ) ) : ?>				<p><strong>Ошибки:</strong></p>				<ul style="margin:0 0 0 18px;list-style:disc;">					<?php foreach ( $result['errors'] as $message ) : ?>						<li><?php echo esc_html( (string) $message ); ?></li>					<?php endforeach; ?>				</ul>			<?php endif; ?>		</div>		<?php	}	private function get_store_status_messages( int $post_id ): string {		$messages = array();		$validation = $this->plugin->get_store_validation_errors( $post_id );		if ( '' !== trim( $validation ) ) {			$messages[] = 'Данные неполные';		}		$coords = $this->plugin->get_store_coordinates( $post_id );		if ( '' === $coords['lat'] || '' === $coords['lng'] ) {			$messages[] = 'Нет координат';		}		return implode( ', ', array_unique( $messages ) );	}}
+<?php
+
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
+
+class WSM_Admin {
+	private WSM_Plugin $plugin;
+	private ?WSM_Importer $importer = null;
+
+	public function __construct( WSM_Plugin $plugin ) {
+		$this->plugin = $plugin;
+
+		add_action( 'admin_menu', array( $this, 'register_menu' ) );
+		add_action( 'add_meta_boxes', array( $this, 'register_meta_boxes' ) );
+		add_action( 'save_post_' . WSM_Plugin::STORE_POST_TYPE, array( $this, 'save_store' ), 10, 2 );
+		add_action( 'save_post_page', array( $this, 'save_page_override' ), 10, 2 );
+		add_action( 'manage_' . WSM_Plugin::STORE_POST_TYPE . '_posts_columns', array( $this, 'register_store_columns' ) );
+		add_action( 'manage_' . WSM_Plugin::STORE_POST_TYPE . '_posts_custom_column', array( $this, 'render_store_columns' ), 10, 2 );
+		add_action( 'admin_post_wsm_save_settings', array( $this, 'save_settings' ) );
+		add_action( 'admin_post_wsm_import_stores', array( $this, 'handle_import' ) );
+		add_action( 'admin_notices', array( $this, 'render_admin_notices' ) );
+	}
+
+	public function register_menu(): void {
+		add_submenu_page(
+			'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE,
+			'Настройки карты магазинов',
+			'Настройки',
+			'manage_options',
+			'wsm-settings',
+			array( $this, 'render_settings_page' )
+		);
+
+		add_submenu_page(
+			'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE,
+			'Импорт магазинов из Excel',
+			'Импорт Excel',
+			'manage_options',
+			'wsm-import',
+			array( $this, 'render_import_page' )
+		);
+
+		add_submenu_page(
+			'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE,
+			'Справка по шорткодам',
+			'Шорткоды',
+			'manage_options',
+			'wsm-shortcodes',
+			array( $this, 'render_shortcodes_page' )
+		);
+	}
+
+	private function get_section_url( string $page_slug, array $query_args = array() ): string {
+		$url = admin_url( 'edit.php?post_type=' . WSM_Plugin::STORE_POST_TYPE . '&page=' . $page_slug );
+
+		if ( ! empty( $query_args ) ) {
+			$url = add_query_arg( $query_args, $url );
+		}
+
+		return $url;
+	}
+
+	private function render_section_navigation( string $active_slug ): void {
+		$tabs = array(
+			'wsm-settings'   => 'Настройки',
+			'wsm-import'     => 'Импорт Excel',
+			'wsm-shortcodes' => 'Шорткоды',
+		);
+
+		echo '<nav class="nav-tab-wrapper" style="margin-top:12px;">';
+		foreach ( $tabs as $slug => $label ) {
+			$class = 'nav-tab' . ( $slug === $active_slug ? ' nav-tab-active' : '' );
+			echo '<a class="' . esc_attr( $class ) . '" href="' . esc_url( $this->get_section_url( $slug ) ) . '">' . esc_html( $label ) . '</a>';
+		}
+		echo '</nav>';
+	}
+
+	public function register_meta_boxes(): void {
+		add_meta_box(
+			'wsm_store_details',
+			'Данные магазина',
+			array( $this, 'render_store_meta_box' ),
+			WSM_Plugin::STORE_POST_TYPE,
+			'normal',
+			'high'
+		);
+
+		add_meta_box(
+			'wsm_page_override',
+			'URL кнопки для карты магазинов',
+			array( $this, 'render_page_override_meta_box' ),
+			'page',
+			'side',
+			'default'
+		);
+	}
+
+	public function register_store_columns( array $columns ): array {
+		$columns['wsm_city']        = 'Город';
+		$columns['wsm_brands']      = 'Бренды';
+		$columns['wsm_coordinates'] = 'Координаты';
+		$columns['wsm_status']      = 'Статус';
+
+		return $columns;
+	}
+
+	public function render_store_columns( string $column, int $post_id ): void {
+		switch ( $column ) {
+			case 'wsm_city':
+				echo esc_html( $this->plugin->get_store_city( $post_id ) ?: '—' );
+				break;
+
+			case 'wsm_brands':
+				$brand_names = array();
+				foreach ( $this->plugin->get_store_brand_slugs( $post_id ) as $slug ) {
+					$brand = $this->plugin->get_brand_data_by_slug( $slug );
+					if ( ! empty( $brand['name'] ) ) {
+						$brand_names[] = (string) $brand['name'];
+					}
+				}
+				echo esc_html( ! empty( $brand_names ) ? implode( ', ', $brand_names ) : '—' );
+				break;
+
+			case 'wsm_coordinates':
+				$coords = $this->plugin->get_store_coordinates( $post_id );
+				echo ( '' !== $coords['lat'] && '' !== $coords['lng'] ) ? esc_html( $coords['lat'] . ', ' . $coords['lng'] ) : '&mdash;';
+				break;
+
+			case 'wsm_status':
+				$errors = $this->get_store_status_messages( $post_id );
+				echo '' !== $errors ? '<span style="color:#b32d2e;">' . esc_html( $errors ) . '</span>' : '<span style="color:#1d7f3f;">Готово</span>';
+				break;
+		}
+	}
+
+	public function render_store_meta_box( WP_Post $post ): void {
+		wp_nonce_field( 'wsm_save_store', 'wsm_store_nonce' );
+
+		$address           = $this->plugin->get_store_address( (int) $post->ID );
+		$city              = $this->plugin->get_store_city( (int) $post->ID );
+		$city_slug         = $this->plugin->normalize_city_slug( $city );
+		$lat               = $this->plugin->get_store_coordinates( (int) $post->ID )['lat'];
+		$lng               = $this->plugin->get_store_coordinates( (int) $post->ID )['lng'];
+		$current_brand_slugs = $this->plugin->get_store_brand_slugs( (int) $post->ID );
+		$validation_errors = $this->plugin->get_store_validation_errors( (int) $post->ID );
+		$geocode_error     = $this->plugin->get_store_geocode_error( (int) $post->ID );
+		$yandex_api_key    = $this->plugin->get_yandex_api_key();
+		$brand_data        = $this->plugin->get_brand_data();
+
+		$cities = $this->plugin->get_existing_city_names();
+		?>
+		<div class="wsm-admin-metabox">
+			<p>
+				<label for="wsm_address"><strong>Адрес</strong></label><br>
+				<input type="text" class="widefat" id="wsm_address" name="wsm_address" value="<?php echo esc_attr( $address ); ?>" placeholder="Москва, Тверская улица, 1">
+			</p>
+
+			<p>
+				<label for="wsm_city"><strong>Город</strong></label><br>
+				<input type="text" class="widefat" list="wsm_city_list" id="wsm_city" name="wsm_city" value="<?php echo esc_attr( $city ); ?>" placeholder="Москва">
+				<datalist id="wsm_city_list">
+					<?php foreach ( $cities as $city_name ) : ?>
+						<option value="<?php echo esc_attr( $city_name ); ?>"></option>
+					<?php endforeach; ?>
+				</datalist>
+			</p>
+
+			<p>
+				<strong>Бренды</strong><br>
+				<?php foreach ( $brand_data as $brand ) : ?>
+					<label style="display:flex;align-items:center;gap:10px;margin:0 0 10px;">
+						<input type="checkbox" name="wsm_brand_slugs[]" value="<?php echo esc_attr( $brand['slug'] ); ?>" <?php checked( in_array( $brand['slug'], $current_brand_slugs, true ) ); ?>>
+						<span style="display:inline-flex;align-items:center;gap:8px;">
+							<span style="width:28px;height:28px;display:inline-flex;align-items:center;justify-content:center;border-radius:8px;background:#f0f0f1;overflow:hidden;flex:0 0 28px;">
+								<?php if ( ! empty( $brand['logo_url'] ) ) : ?>
+									<img src="<?php echo esc_url( $brand['logo_url'] ); ?>" alt="<?php echo esc_attr( $brand['name'] ); ?>" style="max-width:100%;max-height:100%;object-fit:contain;">
+								<?php else : ?>
+									<span aria-hidden="true">&bull;</span>
+								<?php endif; ?>
+							</span>
+							<strong><?php echo esc_html( $brand['name'] ); ?></strong>
+						</span>
+					</label>
+				<?php endforeach; ?>
+				<span class="description">Можно выбрать несколько брендов.</span>
+			</p>
+
+			<p>
+				<label for="wsm_latitude"><strong>Широта</strong></label><br>
+				<input type="text" class="regular-text" id="wsm_latitude" name="wsm_latitude" value="<?php echo esc_attr( $lat ); ?>" placeholder="55.7558">
+				<label for="wsm_longitude" style="margin-left:12px;"><strong>Долгота</strong></label>
+				<input type="text" class="regular-text" id="wsm_longitude" name="wsm_longitude" value="<?php echo esc_attr( $lng ); ?>" placeholder="37.6173">
+			</p>
+
+			<p class="description">Если координаты пусты, плагин попробует получить их через Яндекс.Геокодер при сохранении. Без API-ключа можно заполнить широту и долготу вручную.</p>
+
+			<?php if ( '' !== $validation_errors ) : ?>
+				<div style="padding:10px 12px;border-left:4px solid #d63638;background:#fcf0f1;margin:12px 0;">
+					<strong>Проблемы с данными:</strong>
+					<ul style="margin:8px 0 0 18px;list-style:disc;">
+						<?php foreach ( preg_split( '/\r?\n+/', trim( $validation_errors ) ) as $message ) : ?>
+							<?php if ( '' === trim( $message ) ) { continue; } ?>
+							<li><?php echo esc_html( $message ); ?></li>
+						<?php endforeach; ?>
+					</ul>
+				</div>
+			<?php endif; ?>
+
+			<?php if ( '' !== $geocode_error ) : ?>
+				<div style="padding:10px 12px;border-left:4px solid #d63638;background:#fcf0f1;margin:12px 0;">
+					<strong>Ошибка геокодирования:</strong>
+					<p style="margin:8px 0 0;"><?php echo esc_html( $geocode_error ); ?></p>
+				</div>
+			<?php elseif ( '' === $yandex_api_key ) : ?>
+				<div style="padding:10px 12px;border-left:4px solid #dba617;background:#fff8e5;margin:12px 0;">
+					<strong>Автогеокодирование выключено:</strong>
+					<p style="margin:8px 0 0;">Не задан API-ключ Яндекс.Карт. Укажите координаты вручную или добавьте ключ в настройках плагина.</p>
+				</div>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	public function render_page_override_meta_box( WP_Post $post ): void {
+		wp_nonce_field( 'wsm_save_page_override', 'wsm_page_override_nonce' );
+		$value = (string) get_post_meta( $post->ID, WSM_Plugin::PAGE_META_OVERRIDE_URL, true );
+		?>
+		<p>
+			<label for="wsm_button_url_override"><strong>URL кнопки</strong></label><br>
+			<input type="url" class="widefat" id="wsm_button_url_override" name="wsm_button_url_override" value="<?php echo esc_attr( $value ); ?>" placeholder="https://example.com/buy">
+		</p>
+		<p class="description">Если URL указан, кнопки в виджете будут вести на него, а текст изменится на «Купить».</p>
+		<?php
+	}
+
+	public function save_store( int $post_id, WP_Post $post ): void {
+		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+			return;
+		}
+
+		if ( wp_is_post_revision( $post_id ) ) {
+			return;
+		}
+
+		if ( ! isset( $_POST['wsm_store_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_store_nonce'] ) ), 'wsm_save_store' ) ) {
+			return;
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			return;
+		}
+
+		$errors = array();
+
+		$title  = isset( $_POST['post_title'] ) ? sanitize_text_field( wp_unslash( $_POST['post_title'] ) ) : get_the_title( $post_id );
+		$address = isset( $_POST['wsm_address'] ) ? sanitize_text_field( wp_unslash( $_POST['wsm_address'] ) ) : '';
+		$city    = isset( $_POST['wsm_city'] ) ? sanitize_text_field( wp_unslash( $_POST['wsm_city'] ) ) : '';
+		$brand_slugs = isset( $_POST['wsm_brand_slugs'] ) && is_array( $_POST['wsm_brand_slugs'] ) ? WSM_Plugin::normalize_store_brand_slugs( wp_unslash( $_POST['wsm_brand_slugs'] ) ) : array();
+		$lat     = isset( $_POST['wsm_latitude'] ) ? WSM_Plugin::sanitize_float( wp_unslash( $_POST['wsm_latitude'] ) ) : '';
+		$lng     = isset( $_POST['wsm_longitude'] ) ? WSM_Plugin::sanitize_float( wp_unslash( $_POST['wsm_longitude'] ) ) : '';
+
+		if ( '' === trim( $title ) ) {
+			$errors[] = 'Укажите название магазина.';
+		}
+
+		if ( '' === trim( $address ) ) {
+			$errors[] = 'Укажите адрес.';
+		}
+
+		if ( '' === trim( $city ) ) {
+			$errors[] = 'Укажите город.';
+		}
+
+		if ( empty( $brand_slugs ) ) {
+			$errors[] = 'Выберите хотя бы один бренд.';
+		}
+
+		update_post_meta( $post_id, WSM_Plugin::STORE_META_ADDRESS, $address );
+		update_post_meta( $post_id, WSM_Plugin::STORE_META_CITY, $city );
+		update_post_meta( $post_id, WSM_Plugin::STORE_META_BRAND_SLUGS, $brand_slugs );
+
+		$coordinates_saved = false;
+		$geocode_error     = '';
+
+		if ( '' !== $lat && '' !== $lng ) {
+			update_post_meta( $post_id, WSM_Plugin::STORE_META_LAT, $lat );
+			update_post_meta( $post_id, WSM_Plugin::STORE_META_LNG, $lng );
+			delete_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR );
+			$coordinates_saved = true;
+		} elseif ( '' !== $city && '' !== $address ) {
+			$result = $this->plugin->geocode_address( $city, $address );
+			if ( is_wp_error( $result ) ) {
+				$geocode_error = $result->get_error_message();
+				delete_post_meta( $post_id, WSM_Plugin::STORE_META_LAT );
+				delete_post_meta( $post_id, WSM_Plugin::STORE_META_LNG );
+				update_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR, $geocode_error );
+			} else {
+				update_post_meta( $post_id, WSM_Plugin::STORE_META_LAT, (string) $result['lat'] );
+				update_post_meta( $post_id, WSM_Plugin::STORE_META_LNG, (string) $result['lng'] );
+				delete_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR );
+				$coordinates_saved = true;
+			}
+		} else {
+			delete_post_meta( $post_id, WSM_Plugin::STORE_META_LAT );
+			delete_post_meta( $post_id, WSM_Plugin::STORE_META_LNG );
+			delete_post_meta( $post_id, WSM_Plugin::STORE_META_GEOCODE_ERROR );
+		}
+
+		if ( ! $coordinates_saved ) {
+			$errors[] = '' !== $geocode_error ? $geocode_error : 'Укажите координаты вручную или настройте автогеокодирование.';
+		}
+
+		if ( ! empty( $errors ) ) {
+			update_post_meta( $post_id, WSM_Plugin::STORE_META_VALIDATION_ERRORS, implode( "\n", array_unique( $errors ) ) );
+		} else {
+			delete_post_meta( $post_id, WSM_Plugin::STORE_META_VALIDATION_ERRORS );
+		}
+	}
+
+	public function save_page_override( int $post_id, WP_Post $post ): void {
+		if ( defined( 'DOING_AUTOSAVE' ) && DOING_AUTOSAVE ) {
+			return;
+		}
+
+		if ( wp_is_post_revision( $post_id ) ) {
+			return;
+		}
+
+		if ( ! isset( $_POST['wsm_page_override_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_page_override_nonce'] ) ), 'wsm_save_page_override' ) ) {
+			return;
+		}
+
+		if ( ! current_user_can( 'edit_post', $post_id ) ) {
+			return;
+		}
+
+		$url = isset( $_POST['wsm_button_url_override'] ) ? WSM_Plugin::sanitize_http_url( wp_unslash( $_POST['wsm_button_url_override'] ) ) : '';
+		if ( '' !== $url ) {
+			update_post_meta( $post_id, WSM_Plugin::PAGE_META_OVERRIDE_URL, $url );
+		} else {
+			delete_post_meta( $post_id, WSM_Plugin::PAGE_META_OVERRIDE_URL );
+		}
+	}
+
+	public function render_settings_page(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Недостаточно прав для доступа к этой странице.' );
+		}
+
+		$brands   = $this->plugin->get_brand_data();
+		$settings = $this->plugin->get_settings();
+		$key      = isset( $settings['yandex_api_key'] ) ? (string) $settings['yandex_api_key'] : '';
+		?>
+		<div class="wrap">
+			<h1>Настройки карты магазинов</h1>
+			<?php $this->render_section_navigation( 'wsm-settings' ); ?>
+			<?php if ( isset( $_GET['wsm_saved'] ) ) : ?>
+				<div class="notice notice-success is-dismissible"><p>Настройки сохранены.</p></div>
+			<?php endif; ?>
+			<?php if ( isset( $_GET['wsm_invalid_urls'] ) ) : ?>
+				<div class="notice notice-warning is-dismissible"><p>Часть URL была сброшена, потому что она не прошла проверку HTTP/HTTPS.</p></div>
+			<?php endif; ?>
+
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>">
+				<?php wp_nonce_field( 'wsm_save_settings', 'wsm_settings_nonce' ); ?>
+				<input type="hidden" name="action" value="wsm_save_settings">
+
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row"><label for="wsm_yandex_api_key">API-ключ Яндекс.Карт</label></th>
+						<td>
+							<input type="text" class="regular-text" id="wsm_yandex_api_key" name="wsm_yandex_api_key" value="<?php echo esc_attr( $key ); ?>">
+							<p class="description">Используется для загрузки карты и автогеокодирования адресов. Без ключа карта покажет fallback-сообщение.</p>
+						</td>
+					</tr>
+				</table>
+
+				<h2>Бренды</h2>
+				<p class="description">В плагине всегда есть ровно 3 фиксированных бренда. Здесь можно изменить названия, логотипы и URL кнопки. Добавление и удаление брендов через UI не предусмотрено.</p>
+				<table class="widefat striped">
+					<thead>
+						<tr>
+							<th>Бренд</th>
+							<th>Логотип URL</th>
+							<th>Default URL кнопки</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $brands as $brand ) : ?>
+							<tr>
+								<td>
+									<strong><?php echo esc_html( $brand['slug'] ); ?></strong>
+									<input type="text" class="widefat" name="wsm_brand[<?php echo esc_attr( $brand['slug'] ); ?>][name]" value="<?php echo esc_attr( $brand['name'] ); ?>" style="margin-top:6px;">
+								</td>
+								<td>
+									<input type="url" class="widefat" name="wsm_brand[<?php echo esc_attr( $brand['slug'] ); ?>][logo_url]" value="<?php echo esc_attr( $brand['logo_url'] ); ?>" placeholder="https://example.com/logo.png">
+								</td>
+								<td>
+									<input type="url" class="widefat" name="wsm_brand[<?php echo esc_attr( $brand['slug'] ); ?>][default_url]" value="<?php echo esc_attr( $brand['default_url'] ); ?>" placeholder="https://example.com/brand">
+								</td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+
+				<?php submit_button( 'Сохранить настройки' ); ?>
+			</form>
+		</div>
+		<?php
+	}
+
+	public function render_import_page(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Недостаточно прав для доступа к этой странице.' );
+		}
+
+		$import_result = $this->get_import_result_from_request();
+		?>
+		<div class="wrap">
+			<h1>Импорт магазинов из Excel</h1>
+			<?php $this->render_section_navigation( 'wsm-import' ); ?>
+			<p class="description">Поддерживаются файлы <code>.xls</code> и <code>.xlsx</code>. Первый непустой лист используется для импорта, первая непустая строка считается заголовком.</p>
+
+			<?php if ( is_array( $import_result ) ) : ?>
+				<?php $this->render_import_result( $import_result ); ?>
+			<?php endif; ?>
+
+			<h2>Какие колонки нужны</h2>
+			<table class="widefat striped">
+				<thead>
+					<tr>
+						<th>Поле</th>
+						<th>Обязательно</th>
+						<th>Допустимые заголовки</th>
+						<th>Примечание</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td><code>title</code></td>
+						<td>Да</td>
+						<td><code>title</code>, <code>name</code>, <code>название</code>, <code>наименование</code>, <code>магазин</code></td>
+						<td>Используется для поиска существующего магазина, если не указан <code>external_id</code>.</td>
+					</tr>
+					<tr>
+						<td><code>city</code></td>
+						<td>Да</td>
+						<td><code>city</code>, <code>город</code></td>
+						<td>Город магазина.</td>
+					</tr>
+					<tr>
+						<td><code>address</code></td>
+						<td>Да</td>
+						<td><code>address</code>, <code>адрес</code></td>
+						<td>Адрес магазина.</td>
+					</tr>
+					<tr>
+						<td><code>brands</code></td>
+						<td>Да</td>
+						<td><code>brands</code>, <code>brand</code>, <code>brand_slugs</code>, <code>brand_slug</code>, <code>бренды</code>, <code>бренд</code></td>
+						<td>Можно перечислять несколько брендов через запятую, точку с запятой, вертикальную черту или перенос строки.</td>
+					</tr>
+					<tr>
+						<td><code>lat</code></td>
+						<td>Нет</td>
+						<td><code>lat</code>, <code>latitude</code>, <code>широта</code></td>
+						<td>Если пусто, плагин попробует геокодировать адрес.</td>
+					</tr>
+					<tr>
+						<td><code>lng</code></td>
+						<td>Нет</td>
+						<td><code>lng</code>, <code>lon</code>, <code>long</code>, <code>longitude</code>, <code>долгота</code></td>
+						<td>Если пусто, плагин попробует геокодировать адрес.</td>
+					</tr>
+					<tr>
+						<td><code>external_id</code></td>
+						<td>Нет</td>
+						<td><code>external_id</code>, <code>id</code>, <code>externalid</code>, <code>код</code>, <code>артикул</code></td>
+						<td>Рекомендуется, если в файле могут повторяться названия магазинов. По нему импорт обновляет записи однозначно.</td>
+					</tr>
+				</tbody>
+			</table>
+
+			<p class="description">Если у нескольких строк одинаковое название и <code>external_id</code> пустой, импорт остановится на неоднозначном совпадении и попросит добавить идентификатор.</p>
+
+			<h2>Загрузить файл</h2>
+			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" enctype="multipart/form-data">
+				<?php wp_nonce_field( 'wsm_import_stores', 'wsm_import_nonce' ); ?>
+				<input type="hidden" name="action" value="wsm_import_stores">
+
+				<table class="form-table" role="presentation">
+					<tr>
+						<th scope="row"><label for="wsm_import_file">Файл Excel</label></th>
+						<td>
+							<input type="file" id="wsm_import_file" name="wsm_import_file" accept=".xls,.xlsx,application/vnd.ms-excel,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet">
+							<p class="description">Импорт создаёт или обновляет магазины в CPT <code>sm_store</code>, сохраняет бренды, адрес и координаты, а при необходимости пытается геокодировать адрес.</p>
+						</td>
+					</tr>
+				</table>
+
+				<?php submit_button( 'Запустить импорт' ); ?>
+			</form>
+		</div>
+		<?php
+	}
+
+	public function render_shortcodes_page(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Недостаточно прав для доступа к этой странице.' );
+		}
+
+		?>
+		<div class="wrap">
+			<h1>Шорткоды</h1>
+			<?php $this->render_section_navigation( 'wsm-shortcodes' ); ?>
+			<p class="description">В плагине сейчас один основной шорткод. Он работает на любой странице WordPress.</p>
+
+			<table class="widefat striped">
+				<thead>
+					<tr>
+						<th>Шорткод</th>
+						<th>Параметры</th>
+						<th>Что делает</th>
+					</tr>
+				</thead>
+				<tbody>
+					<tr>
+						<td><code>[stores_map]</code></td>
+						<td><code>button_url</code> - необязательный URL внешней кнопки</td>
+						<td>Показывает карту, список магазинов и карточки брендов. Если <code>button_url</code> задан, все CTA в этом встраивании ведут на него, а текст меняется на <code>Купить</code>.</td>
+					</tr>
+				</tbody>
+			</table>
+
+			<h2>Приоритет URL кнопки</h2>
+			<ol>
+				<li>Параметр шорткода <code>button_url</code></li>
+				<li>URL кнопки в метабоксе страницы <code>URL кнопки для карты магазинов</code></li>
+				<li>Default URL бренда в <code>Магазины -> Настройки</code></li>
+			</ol>
+
+			<h2>Примеры</h2>
+			<pre><code>[stores_map]</code></pre>
+			<pre><code>[stores_map button_url="https://example.com/buy"]</code></pre>
+		</div>
+		<?php
+	}
+
+	public function save_settings(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Недостаточно прав для сохранения настроек.' );
+		}
+
+		if ( ! isset( $_POST['wsm_settings_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_settings_nonce'] ) ), 'wsm_save_settings' ) ) {
+			wp_die( 'Неверный nonce.' );
+		}
+
+		$settings = $this->plugin->get_settings();
+		$settings['yandex_api_key'] = isset( $_POST['wsm_yandex_api_key'] ) ? sanitize_text_field( wp_unslash( $_POST['wsm_yandex_api_key'] ) ) : '';
+
+		$brands_input = isset( $_POST['wsm_brand'] ) && is_array( $_POST['wsm_brand'] ) ? wp_unslash( $_POST['wsm_brand'] ) : array();
+		$invalid_url_detected = false;
+
+		foreach ( $this->plugin->get_brand_data() as $brand ) {
+			$slug = (string) $brand['slug'];
+			$row  = isset( $brands_input[ $slug ] ) && is_array( $brands_input[ $slug ] ) ? $brands_input[ $slug ] : array();
+
+			$name        = isset( $row['name'] ) ? sanitize_text_field( (string) $row['name'] ) : (string) $brand['name'];
+			$logo_url    = isset( $row['logo_url'] ) ? WSM_Plugin::sanitize_http_url( (string) $row['logo_url'] ) : '';
+			$default_url = isset( $row['default_url'] ) ? WSM_Plugin::sanitize_http_url( (string) $row['default_url'] ) : '';
+
+			if ( '' !== (string) ( $row['logo_url'] ?? '' ) && '' === $logo_url ) {
+				$invalid_url_detected = true;
+			}
+
+			if ( '' !== (string) ( $row['default_url'] ?? '' ) && '' === $default_url ) {
+				$invalid_url_detected = true;
+			}
+
+			$settings['brands'][ $slug ] = array(
+				'name'        => '' !== trim( $name ) ? $name : (string) $brand['name'],
+				'logo_url'    => $logo_url,
+				'default_url' => $default_url,
+			);
+		}
+
+		update_option( WSM_Plugin::OPTION_KEY, WSM_Plugin::normalize_settings( $settings ), false );
+
+		$query_args = array(
+			'wsm_saved' => 1,
+		);
+
+		if ( $invalid_url_detected ) {
+			$query_args['wsm_invalid_urls'] = 1;
+		}
+
+		wp_safe_redirect( $this->get_section_url( 'wsm-settings', $query_args ) );
+		exit;
+	}
+
+	public function handle_import(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			wp_die( 'Недостаточно прав для импорта.' );
+		}
+
+		if ( ! isset( $_POST['wsm_import_nonce'] ) || ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['wsm_import_nonce'] ) ), 'wsm_import_stores' ) ) {
+			wp_die( 'Неверный nonce.' );
+		}
+
+		$file = isset( $_FILES['wsm_import_file'] ) && is_array( $_FILES['wsm_import_file'] ) ? $_FILES['wsm_import_file'] : array();
+
+		try {
+			$import_result = $this->get_importer()->import_uploaded_file( $file );
+		} catch ( Throwable $exception ) {
+			$import_result = new WP_Error( 'wsm_import_exception', $exception->getMessage() );
+		}
+
+		if ( is_wp_error( $import_result ) ) {
+			$result = array(
+				'file_name'     => isset( $file['name'] ) ? (string) $file['name'] : '',
+				'file_type'     => '',
+				'sheet_name'    => '',
+				'rows_seen'     => 0,
+				'rows_imported' => 0,
+				'created'       => 0,
+				'updated'       => 0,
+				'skipped'       => 0,
+				'warnings'      => array(),
+				'errors'        => array( $import_result->get_error_message() ),
+				'header_map'    => array(),
+				'required_keys' => array( 'title', 'city', 'address', 'brands' ),
+				'import_status' => 'error',
+			);
+		} else {
+			$result = $import_result;
+		}
+
+		$token = wp_generate_password( 12, false, false );
+		set_transient( $this->get_import_result_transient_key( $token ), $result, 10 * MINUTE_IN_SECONDS );
+
+		wp_safe_redirect( $this->get_section_url( 'wsm-import', array( 'wsm_import_token' => $token ) ) );
+		exit;
+	}
+
+	public function render_admin_notices(): void {
+		$current_screen = function_exists( 'get_current_screen' ) ? get_current_screen() : null;
+		if ( ! $current_screen || WSM_Plugin::STORE_POST_TYPE !== $current_screen->post_type ) {
+			return;
+		}
+
+		if ( ! isset( $_GET['post'] ) ) {
+			return;
+		}
+
+		$post_id = absint( $_GET['post'] );
+		if ( ! $post_id ) {
+			return;
+		}
+
+		$geocode_error = $this->plugin->get_store_geocode_error( $post_id );
+		if ( '' !== $geocode_error ) {
+			echo '<div class="notice notice-error is-dismissible"><p><strong>Магазин:</strong> ' . esc_html( $geocode_error ) . '</p></div>';
+		}
+	}
+
+	private function get_importer(): WSM_Importer {
+		if ( null === $this->importer ) {
+			$this->importer = new WSM_Importer( $this->plugin );
+		}
+
+		return $this->importer;
+	}
+
+	private function get_import_result_transient_key( string $token ): string {
+		return 'wsm_import_result_' . sanitize_key( $token );
+	}
+
+	private function get_import_result_from_request(): ?array {
+		if ( ! isset( $_GET['wsm_import_token'] ) ) {
+			return null;
+		}
+
+		$token = sanitize_key( (string) wp_unslash( $_GET['wsm_import_token'] ) );
+		if ( '' === $token ) {
+			return null;
+		}
+
+		$result = get_transient( $this->get_import_result_transient_key( $token ) );
+		if ( ! is_array( $result ) ) {
+			return null;
+		}
+
+		delete_transient( $this->get_import_result_transient_key( $token ) );
+
+		return $result;
+	}
+
+	private function render_import_result( array $result ): void {
+		$status = isset( $result['import_status'] ) ? (string) $result['import_status'] : 'success';
+		$class  = 'success';
+		$title  = 'Импорт завершён.';
+
+		if ( 'warning' === $status ) {
+			$class = 'warning';
+			$title = 'Импорт завершён с предупреждениями.';
+		} elseif ( 'error' === $status ) {
+			$class = 'error';
+			$title = 'Импорт не выполнен.';
+		}
+
+		$labels = array(
+			'title'       => 'Название',
+			'city'        => 'Город',
+			'address'     => 'Адрес',
+			'brands'      => 'Бренды',
+			'lat'         => 'Широта',
+			'lng'         => 'Долгота',
+			'external_id' => 'external_id',
+		);
+		?>
+		<div class="notice notice-<?php echo esc_attr( $class ); ?> is-dismissible">
+			<p><strong><?php echo esc_html( $title ); ?></strong></p>
+			<ul style="margin:0 0 0 18px;list-style:disc;">
+				<li><?php echo esc_html( 'Файл: ' . (string) ( $result['file_name'] ?? '—' ) ); ?></li>
+				<li><?php echo esc_html( 'Лист: ' . (string) ( $result['sheet_name'] ?? '—' ) ); ?></li>
+				<li><?php echo esc_html( 'Строк обработано: ' . (string) ( $result['rows_seen'] ?? 0 ) ); ?></li>
+				<li><?php echo esc_html( 'Импортировано: ' . (string) ( $result['rows_imported'] ?? 0 ) ); ?></li>
+				<li><?php echo esc_html( 'Создано: ' . (string) ( $result['created'] ?? 0 ) ); ?></li>
+				<li><?php echo esc_html( 'Обновлено: ' . (string) ( $result['updated'] ?? 0 ) ); ?></li>
+				<li><?php echo esc_html( 'Пропущено: ' . (string) ( $result['skipped'] ?? 0 ) ); ?></li>
+			</ul>
+
+			<?php if ( ! empty( $result['header_map'] ) && is_array( $result['header_map'] ) ) : ?>
+				<p><strong>Сопоставление колонок:</strong></p>
+				<table class="widefat striped" style="max-width:760px;">
+					<thead>
+						<tr>
+							<th>Поле</th>
+							<th>Заголовок в файле</th>
+						</tr>
+					</thead>
+					<tbody>
+						<?php foreach ( $result['header_map'] as $field => $meta ) : ?>
+							<tr>
+								<td><?php echo esc_html( $labels[ $field ] ?? (string) $field ); ?></td>
+								<td><code><?php echo esc_html( (string) ( $meta['header'] ?? '' ) ); ?></code></td>
+							</tr>
+						<?php endforeach; ?>
+					</tbody>
+				</table>
+			<?php endif; ?>
+
+			<?php if ( ! empty( $result['warnings'] ) && is_array( $result['warnings'] ) ) : ?>
+				<p><strong>Предупреждения:</strong></p>
+				<ul style="margin:0 0 0 18px;list-style:disc;">
+					<?php foreach ( $result['warnings'] as $message ) : ?>
+						<li><?php echo esc_html( (string) $message ); ?></li>
+					<?php endforeach; ?>
+				</ul>
+			<?php endif; ?>
+
+			<?php if ( ! empty( $result['errors'] ) && is_array( $result['errors'] ) ) : ?>
+				<p><strong>Ошибки:</strong></p>
+				<ul style="margin:0 0 0 18px;list-style:disc;">
+					<?php foreach ( $result['errors'] as $message ) : ?>
+						<li><?php echo esc_html( (string) $message ); ?></li>
+					<?php endforeach; ?>
+				</ul>
+			<?php endif; ?>
+		</div>
+		<?php
+	}
+
+	private function get_store_status_messages( int $post_id ): string {
+		$messages = array();
+
+		$validation = $this->plugin->get_store_validation_errors( $post_id );
+		if ( '' !== trim( $validation ) ) {
+			$messages[] = 'Данные неполные';
+		}
+
+		$coords = $this->plugin->get_store_coordinates( $post_id );
+		if ( '' === $coords['lat'] || '' === $coords['lng'] ) {
+			$messages[] = 'Нет координат';
+		}
+
+		return implode( ', ', array_unique( $messages ) );
+	}
+}
