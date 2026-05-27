@@ -3,11 +3,11 @@ node_modules/
 vendor/
 
 # Build artifacts
-dist/
 build/
+dist/
 *.min.js
 *.min.css
-*.map
+*.zip
 
 # Logs
 *.log
@@ -17,7 +17,13 @@ build/
 .env.local
 .env.*
 
-# OS generated files
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
 .DS_Store
 Thumbs.db
 
@@ -25,38 +31,3 @@ Thumbs.db
 wp-content/cache/
 *.sql
 wp-config-local.php
-
-# Backup files
-*.bak
-*.backup
-*~
-
-# IDE files
-.vscode/
-.idea/
-*.swp
-*.swo
-
-# Compressed files
-*.zip
-*.tar
-*.gz
-*.tgz
-*.bz2
-*.xz
-*.7z
-*.rar
-*.zst
-*.lz4
-*.lzh
-*.cab
-*.arj
-*.rpm
-*.deb
-*.Z
-*.lz
-*.lzo
-*.tar.gz
-*.tar.bz2
-*.tar.xz
-*.tar.zst
