@@ -582,11 +582,22 @@ class WSM_Plugin {
 
         public function get_store_coordinates( int $post_id ): array {
 
+                $raw_lat = get_post_meta( $post_id, self::STORE_META_LAT, true );
+                $raw_lng = get_post_meta( $post_id, self::STORE_META_LNG, true );
+                
+                // Debug: log raw coordinates from database
+                error_log( sprintf(
+                    'WSM Store #%d raw coords: lat_raw="%s", lng_raw="%s"',
+                    $post_id,
+                    var_export( $raw_lat, true ),
+                    var_export( $raw_lng, true )
+                ) );
+
                 return array(
 
-                        'lat' => self::sanitize_float( get_post_meta( $post_id, self::STORE_META_LAT, true ) ),
+                        'lat' => self::sanitize_float( $raw_lat ),
 
-                        'lng' => self::sanitize_float( get_post_meta( $post_id, self::STORE_META_LNG, true ) ),
+                        'lng' => self::sanitize_float( $raw_lng ),
 
                 );
 
@@ -881,6 +892,8 @@ class WSM_Plugin {
 
         public function get_valid_stores(): array {
 
+                error_log( 'WSM: Starting get_valid_stores()' );
+
                 $query = new WP_Query(
 
                         array(
@@ -907,6 +920,7 @@ class WSM_Plugin {
 
                 );
 
+                error_log( sprintf( 'WSM: Found %d published stores', count( $query->posts ) ) );
 
 
                 $stores = array();
@@ -919,14 +933,18 @@ class WSM_Plugin {
 
                         foreach ( $query->posts as $post_id ) {
 
+                                error_log( sprintf( 'WSM: Processing store #%d "%s"', (int) $post_id, get_the_title( (int) $post_id ) ) );
+
                                 $store = $this->build_store_record( (int) $post_id );
 
                                 if ( ! $store ) {
 
+                                        error_log( sprintf( 'WSM: Store #%d rejected by build_store_record', (int) $post_id ) );
                                         continue;
 
                                 }
 
+                                error_log( sprintf( 'WSM: Store #%d accepted with coords (%s, %s)', (int) $post_id, $store['lat'], $store['lng'] ) );
 
 
                                 $stores[] = $store;
@@ -1147,17 +1165,22 @@ class WSM_Plugin {
 
         public static function sanitize_float( $value ): string {
 
+                // Debug: log input value
+                error_log( sprintf( 'WSM sanitize_float input: %s (type: %s)', var_export( $value, true ), gettype( $value ) ) );
+
                 $value = is_string( $value ) ? trim( str_replace( ',', '.', $value ) ) : (string) $value;
 
                 if ( '' === $value || ! is_numeric( $value ) ) {
 
+                        error_log( sprintf( 'WSM sanitize_float rejected: \"%s\"', $value ) );
                         return '';
 
                 }
 
 
-
-                return (string) (float) $value;
+                $result = (string) (float) $value;
+                error_log( sprintf( 'WSM sanitize_float result: \"%s\"', $result ) );
+                return $result;
 
         }
 
