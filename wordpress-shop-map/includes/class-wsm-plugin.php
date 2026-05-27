@@ -1,567 +1,1147 @@
 <?php
 
+
+
 if ( ! defined( 'ABSPATH' ) ) {
-	exit;
+
+        exit;
+
 }
 
+
+
 class WSM_Plugin {
-	public const OPTION_KEY = 'wsm_settings';
-	public const STORE_POST_TYPE = 'sm_store';
-
-	public const STORE_META_CITY = '_wsm_store_city';
-	public const STORE_META_ADDRESS = '_wsm_store_address';
-	public const STORE_META_BRAND_SLUGS = '_wsm_store_brand_slugs';
-	public const STORE_META_EXTERNAL_ID = '_wsm_store_external_id';
-	public const STORE_META_LAT = '_wsm_store_lat';
-	public const STORE_META_LNG = '_wsm_store_lng';
-	public const STORE_META_GEOCODE_ERROR = '_wsm_store_geocode_error';
-	public const STORE_META_VALIDATION_ERRORS = '_wsm_store_validation_errors';
-
-	public const PAGE_META_OVERRIDE_URL = '_wsm_button_url_override';
-
-	private static ?WSM_Plugin $instance = null;
-
-	private $admin = null;
-	private $frontend = null;
-	private $geocoder = null;
-
-	public static function instance(): self {
-		if ( null === self::$instance ) {
-			self::$instance = new self();
-		}
-
-		return self::$instance;
-	}
-
-	public static function activate(): void {
-		$settings = self::normalize_settings( get_option( self::OPTION_KEY, array() ) );
-		update_option( self::OPTION_KEY, $settings, false );
-	}
-
-	public function init(): void {
-		add_action( 'init', array( $this, 'register_content_types' ) );
-
-		if ( is_admin() ) {
-			$this->admin = new WSM_Admin( $this );
-		}
-
-		$this->frontend = new WSM_Frontend( $this );
-	}
-
-	public function register_content_types(): void {
-		register_post_type(
-			self::STORE_POST_TYPE,
-			array(
-				'labels'             => array(
-					'name'               => 'Магазины',
-					'singular_name'      => 'Магазин',
-					'add_new'            => 'Добавить магазин',
-					'add_new_item'       => 'Добавить магазин',
-					'edit_item'          => 'Редактировать магазин',
-					'new_item'           => 'Новый магазин',
-					'view_item'          => 'Просмотр магазина',
-					'search_items'       => 'Найти магазин',
-					'not_found'          => 'Магазины не найдены',
-					'not_found_in_trash' => 'Магазины не найдены в корзине',
-					'menu_name'          => 'Магазины',
-				),
-				'public'             => false,
-				'show_ui'            => true,
-				'show_in_menu'       => true,
-				'show_in_rest'       => false,
-				'publicly_queryable' => false,
-				'exclude_from_search' => true,
-				'has_archive'        => false,
-				'rewrite'            => false,
-				'query_var'          => false,
-				'menu_icon'          => 'dashicons-location-alt',
-				'supports'           => array( 'title' ),
-			)
-		);
-	}
-
-	public static function brand_slots(): array {
-		return array(
-			array(
-				'slug'  => 'brand-1',
-				'label' => 'Бренд 1',
-				'order' => 1,
-			),
-			array(
-				'slug'  => 'brand-2',
-				'label' => 'Бренд 2',
-				'order' => 2,
-			),
-			array(
-				'slug'  => 'brand-3',
-				'label' => 'Бренд 3',
-				'order' => 3,
-			),
-		);
-	}
-
-	public static function default_settings(): array {
-		$brands = array();
-
-		foreach ( self::brand_slots() as $slot ) {
-			$brands[ $slot['slug'] ] = array(
-				'name'        => $slot['label'],
-				'logo_url'    => '',
-				'default_url' => '',
-			);
-		}
-
-		return array(
-			'yandex_api_key' => '',
-			'brands'         => $brands,
-		);
-	}
-
-	public static function normalize_settings( $settings ): array {
-		$settings = is_array( $settings ) ? $settings : array();
-		$merged   = self::default_settings();
-
-		$merged['yandex_api_key'] = isset( $settings['yandex_api_key'] ) ? sanitize_text_field( (string) $settings['yandex_api_key'] ) : '';
-
-		$brands = isset( $settings['brands'] ) && is_array( $settings['brands'] ) ? $settings['brands'] : array();
-
-		foreach ( self::brand_slots() as $slot ) {
-			$slug    = (string) $slot['slug'];
-			$raw     = isset( $brands[ $slug ] ) && is_array( $brands[ $slug ] ) ? $brands[ $slug ] : array();
-			$name    = isset( $raw['name'] ) ? sanitize_text_field( (string) $raw['name'] ) : '';
-			$logo    = isset( $raw['logo_url'] ) ? self::sanitize_http_url( (string) $raw['logo_url'] ) : '';
-			$default = isset( $raw['default_url'] ) ? self::sanitize_http_url( (string) $raw['default_url'] ) : '';
-
-			if ( '' === $name ) {
-				$name = (string) $slot['label'];
-			}
-
-			$merged['brands'][ $slug ] = array(
-				'name'        => $name,
-				'logo_url'    => $logo,
-				'default_url' => $default,
-			);
-		}
-
-		return $merged;
-	}
-
-	public function get_settings(): array {
-		return self::normalize_settings( get_option( self::OPTION_KEY, array() ) );
-	}
-
-	public function get_brand_data(): array {
-		$settings = $this->get_settings();
-		$data     = array();
-
-		foreach ( self::brand_slots() as $slot ) {
-			$slug          = (string) $slot['slug'];
-			$brand_settings = isset( $settings['brands'][ $slug ] ) && is_array( $settings['brands'][ $slug ] ) ? $settings['brands'][ $slug ] : array();
-			$name          = isset( $brand_settings['name'] ) ? trim( (string) $brand_settings['name'] ) : '';
-			$logo_url      = isset( $brand_settings['logo_url'] ) ? self::sanitize_http_url( (string) $brand_settings['logo_url'] ) : '';
-			$default_url   = isset( $brand_settings['default_url'] ) ? self::sanitize_http_url( (string) $brand_settings['default_url'] ) : '';
-
-			if ( '' === $name ) {
-				$name = (string) $slot['label'];
-			}
-
-			$data[] = array(
-				'slug'         => $slug,
-				'order'        => (int) $slot['order'],
-				'name'         => $name,
-				'logo_url'     => $logo_url,
-				'default_url'  => $default_url,
-				'has_logo'     => '' !== $logo_url,
-				'has_url'      => '' !== $default_url,
-			);
-		}
-
-		return $data;
-	}
-
-	public function get_brand_lookup(): array {
-		$lookup = array();
-
-		foreach ( $this->get_brand_data() as $brand ) {
-			$lookup[ $brand['slug'] ] = $brand;
-		}
-
-		return $lookup;
-	}
-
-	public function get_brand_data_by_slug( string $slug ): array {
-		$slug = sanitize_key( $slug );
-
-		foreach ( $this->get_brand_data() as $brand ) {
-			if ( $brand['slug'] === $slug ) {
-				return $brand;
-			}
-		}
-
-		return array();
-	}
-
-	public function get_brand_slugs(): array {
-		return wp_list_pluck( $this->get_brand_data(), 'slug' );
-	}
-
-	public function get_yandex_api_key(): string {
-		$settings = $this->get_settings();
-
-		return isset( $settings['yandex_api_key'] ) ? trim( (string) $settings['yandex_api_key'] ) : '';
-	}
-
-	public function get_geocoder() {
-		if ( null === $this->geocoder ) {
-			$this->geocoder = new WSM_Geocoder( $this );
-		}
-
-		return $this->geocoder;
-	}
-
-	public function geocode_address( string $city, string $address ) {
-		return $this->get_geocoder()->geocode( $city, $address );
-	}
-
-	public function get_page_override_url( int $post_id ): string {
-		if ( $post_id <= 0 ) {
-			return '';
-		}
-
-		return self::sanitize_http_url( (string) get_post_meta( $post_id, self::PAGE_META_OVERRIDE_URL, true ) );
-	}
-
-	public function get_context_override_url( int $post_id, string $shortcode_override = '' ): string {
-		$shortcode_override = self::sanitize_http_url( $shortcode_override );
-
-		if ( '' !== $shortcode_override ) {
-			return $shortcode_override;
-		}
-
-		return $this->get_page_override_url( $post_id );
-	}
-
-	public function resolve_button_text( string $override_url = '' ): string {
-		return '' !== trim( $override_url ) ? 'Купить' : 'Перейти на сайт';
-	}
-
-	public function resolve_brand_button_url( string $brand_slug, string $override_url = '' ): string {
-		$override_url = self::sanitize_http_url( $override_url );
-		if ( '' !== $override_url ) {
-			return $override_url;
-		}
-
-		$brand = $this->get_brand_data_by_slug( $brand_slug );
-
-		return isset( $brand['default_url'] ) ? (string) $brand['default_url'] : '';
-	}
-
-	public function build_cta_for_brand( string $brand_slug, string $override_url = '' ): array {
-		return array(
-			'url'  => $this->resolve_brand_button_url( $brand_slug, $override_url ),
-			'text' => $this->resolve_button_text( $override_url ),
-		);
-	}
-
-	public function normalize_city_slug( string $city ): string {
-		$city = trim( sanitize_text_field( $city ) );
-		if ( '' === $city ) {
-			return '';
-		}
-
-		$slug = sanitize_title( $city );
-		if ( '' === $slug ) {
-			$slug = sanitize_key( $city );
-		}
-
-		if ( '' === $slug ) {
-			$slug = substr( md5( $city ), 0, 8 );
-		}
-
-		return $slug;
-	}
-
-	public function get_store_city( int $post_id ): string {
-		return trim( (string) get_post_meta( $post_id, self::STORE_META_CITY, true ) );
-	}
-
-	public function get_store_address( int $post_id ): string {
-		return trim( (string) get_post_meta( $post_id, self::STORE_META_ADDRESS, true ) );
-	}
-
-	public function get_store_coordinates( int $post_id ): array {
-		return array(
-			'lat' => self::sanitize_float( get_post_meta( $post_id, self::STORE_META_LAT, true ) ),
-			'lng' => self::sanitize_float( get_post_meta( $post_id, self::STORE_META_LNG, true ) ),
-		);
-	}
-
-	public function get_store_brand_slugs( int $post_id ): array {
-		return self::normalize_store_brand_slugs( get_post_meta( $post_id, self::STORE_META_BRAND_SLUGS, true ) );
-	}
-
-	public function get_store_validation_errors( int $post_id ): string {
-		return (string) get_post_meta( $post_id, self::STORE_META_VALIDATION_ERRORS, true );
-	}
-
-	public function get_store_geocode_error( int $post_id ): string {
-		return (string) get_post_meta( $post_id, self::STORE_META_GEOCODE_ERROR, true );
-	}
-
-	public function get_existing_city_names(): array {
-		$query = new WP_Query(
-			array(
-				'post_type'              => self::STORE_POST_TYPE,
-				'post_status'            => 'publish',
-				'posts_per_page'         => -1,
-				'fields'                 => 'ids',
-				'no_found_rows'          => true,
-				'ignore_sticky_posts'    => true,
-				'update_post_meta_cache' => false,
-				'update_post_term_cache' => false,
-			)
-		);
-
-		$cities = array();
-		if ( $query->have_posts() ) {
-			foreach ( $query->posts as $post_id ) {
-				$city = $this->get_store_city( (int) $post_id );
-				if ( '' === $city ) {
-					continue;
-				}
-
-				$cities[ $this->normalize_city_slug( $city ) ] = $city;
-			}
-		}
-
-		wp_reset_postdata();
-
-		uasort(
-			$cities,
-			static function ( $left, $right ) {
-				return strcasecmp( $left, $right );
-			}
-		);
-
-		return array_values( $cities );
-	}
-
-	public static function normalize_store_brand_slugs( $raw_slugs ): array {
-		if ( is_string( $raw_slugs ) ) {
-			$raw_slugs = preg_split( '/[\s,]+/', $raw_slugs );
-		}
-
-		if ( ! is_array( $raw_slugs ) ) {
-			$raw_slugs = array();
-		}
-
-		$allowed = array_flip( wp_list_pluck( self::brand_slots(), 'slug' ) );
-		$slugs   = array();
-
-		foreach ( $raw_slugs as $raw_slug ) {
-			$slug = sanitize_key( (string) $raw_slug );
-			if ( '' !== $slug && isset( $allowed[ $slug ] ) ) {
-				$slugs[] = $slug;
-			}
-		}
-
-		$ordered = array();
-		foreach ( self::brand_slots() as $slot ) {
-			if ( in_array( $slot['slug'], $slugs, true ) ) {
-				$ordered[] = $slot['slug'];
-			}
-		}
-
-		return $ordered;
-	}
-
-	public function build_store_record( int $post_id ): ?array {
-		$title         = trim( (string) get_the_title( $post_id ) );
-		$city          = $this->get_store_city( $post_id );
-		$city_slug     = $this->normalize_city_slug( $city );
-		$address       = $this->get_store_address( $post_id );
-		$brand_slugs   = $this->get_store_brand_slugs( $post_id );
-		$coordinates   = $this->get_store_coordinates( $post_id );
-		$brand_lookup  = $this->get_brand_lookup();
-		$brand_records = array();
-
-		if ( '' === $title || '' === $city || '' === $city_slug || '' === $address || empty( $brand_slugs ) || '' === $coordinates['lat'] || '' === $coordinates['lng'] ) {
-			return null;
-		}
-
-		foreach ( $brand_slugs as $slug ) {
-			if ( isset( $brand_lookup[ $slug ] ) ) {
-				$brand_records[] = $brand_lookup[ $slug ];
-			}
-		}
-
-		usort(
-			$brand_records,
-			static function ( $left, $right ) {
-				if ( $left['order'] === $right['order'] ) {
-					return strcasecmp( $left['name'], $right['name'] );
-				}
-
-				return $left['order'] <=> $right['order'];
-			}
-		);
-
-		if ( empty( $brand_records ) ) {
-			return null;
-		}
-
-		return array(
-			'id'          => $post_id,
-			'title'       => $title,
-			'address'     => $address,
-			'city'        => array(
-				'slug' => $city_slug,
-				'name' => $city,
-			),
-			'brand_slugs' => $brand_slugs,
-			'brand_data'  => $brand_records,
-			'lat'         => (float) $coordinates['lat'],
-			'lng'         => (float) $coordinates['lng'],
-		);
-	}
-
-	public function get_valid_stores(): array {
-		$query = new WP_Query(
-			array(
-				'post_type'           => self::STORE_POST_TYPE,
-				'post_status'         => 'publish',
-				'posts_per_page'      => -1,
-				'orderby'             => 'title',
-				'order'               => 'ASC',
-				'no_found_rows'       => true,
-				'ignore_sticky_posts' => true,
-			)
-		);
-
-		$stores = array();
-		$cities = array();
-
-		if ( $query->have_posts() ) {
-			foreach ( $query->posts as $post_id ) {
-				$store = $this->build_store_record( (int) $post_id );
-				if ( ! $store ) {
-					continue;
-				}
-
-				$stores[] = $store;
-				$cities[ $store['city']['slug'] ] = $store['city'];
-			}
-		}
-
-		wp_reset_postdata();
-
-		usort(
-			$stores,
-			static function ( $left, $right ) {
-				return strcasecmp( $left['title'], $right['title'] );
-			}
-		);
-
-		$cities = array_values( $cities );
-		usort(
-			$cities,
-			static function ( $left, $right ) {
-				return strcasecmp( $left['name'], $right['name'] );
-			}
-		);
-
-		return array(
-			'stores' => $stores,
-			'cities' => $cities,
-		);
-	}
-
-	public function determine_initial_brand_slug( array $brands, array $stores ): string {
-		if ( empty( $brands ) ) {
-			return '';
-		}
-
-		$available_brand_slugs = array();
-		foreach ( $stores as $store ) {
-			foreach ( (array) ( $store['brand_slugs'] ?? array() ) as $slug ) {
-				$available_brand_slugs[ (string) $slug ] = true;
-			}
-		}
-
-		foreach ( $brands as $brand ) {
-			if ( isset( $available_brand_slugs[ $brand['slug'] ] ) ) {
-				return (string) $brand['slug'];
-			}
-		}
-
-		return (string) $brands[0]['slug'];
-	}
-
-	public function get_frontend_payload( string $override_url = '', int $context_post_id = 0 ): array {
-		$brands_result = $this->get_brand_data();
-		$stores_result = $this->get_valid_stores();
-		$stores        = $stores_result['stores'];
-		$cities        = $stores_result['cities'];
-		$override_url  = self::sanitize_http_url( $override_url );
-		$active_brand  = $this->determine_initial_brand_slug( $brands_result, $stores );
-		$map_center    = null;
-
-		if ( ! empty( $stores ) ) {
-			$map_center = array(
-				'lat' => (float) $stores[0]['lat'],
-				'lng' => (float) $stores[0]['lng'],
-			);
-		}
-
-		return array(
-			'brands'          => $brands_result,
-			'cities'          => $cities,
-			'stores'          => $stores,
-			'active_brand'    => $active_brand,
-			'override_url'    => $override_url,
-			'override_label'  => $this->resolve_button_text( $override_url ),
-			'yandex_api_key'  => $this->get_yandex_api_key(),
-			'map_center'      => $map_center,
-			'context_post_id' => $context_post_id,
-			'branding'        => array(
-				'site_button_text' => 'Перейти на сайт',
-				'buy_button_text'  => 'Купить',
-			),
-			'strings'         => array(
-				'all_cities'      => 'Все города',
-				'no_stores'       => 'Нет магазинов для выбранных фильтров.',
-				'no_valid_stores' => 'Пока нет магазинов с координатами для отображения.',
-				'map_key_missing' => 'Укажите API-ключ Яндекс.Карт в настройках плагина.',
-				'map_unavailable' => 'Карта временно недоступна.',
-			),
-		);
-	}
-
-	public static function sanitize_http_url( string $value ): string {
-		$value = trim( $value );
-		if ( '' === $value ) {
-			return '';
-		}
-
-		$validated = function_exists( 'wp_http_validate_url' ) ? wp_http_validate_url( $value ) : filter_var( $value, FILTER_VALIDATE_URL );
-		if ( ! $validated ) {
-			return '';
-		}
-
-		$scheme = wp_parse_url( $validated, PHP_URL_SCHEME );
-		if ( ! in_array( strtolower( (string) $scheme ), array( 'http', 'https' ), true ) ) {
-			return '';
-		}
-
-		return esc_url_raw( $validated );
-	}
-
-	public static function sanitize_float( $value ): string {
-		$value = is_string( $value ) ? trim( str_replace( ',', '.', $value ) ) : (string) $value;
-		if ( '' === $value || ! is_numeric( $value ) ) {
-			return '';
-		}
-
-		return (string) (float) $value;
-	}
+
+        public const OPTION_KEY = 'wsm_settings';
+
+        public const STORE_POST_TYPE = 'sm_store';
+
+
+
+        public const STORE_META_CITY = '_wsm_store_city';
+
+        public const STORE_META_ADDRESS = '_wsm_store_address';
+
+        public const STORE_META_BRAND_SLUGS = '_wsm_store_brand_slugs';
+
+        public const STORE_META_EXTERNAL_ID = '_wsm_store_external_id';
+
+        public const STORE_META_LAT = '_wsm_store_lat';
+
+        public const STORE_META_LNG = '_wsm_store_lng';
+
+        public const STORE_META_GEOCODE_ERROR = '_wsm_store_geocode_error';
+
+        public const STORE_META_VALIDATION_ERRORS = '_wsm_store_validation_errors';
+
+
+
+        public const PAGE_META_OVERRIDE_URL = '_wsm_button_url_override';
+
+
+
+        private static ?WSM_Plugin $instance = null;
+
+
+
+        private $admin = null;
+
+        private $frontend = null;
+
+        private $geocoder = null;
+
+
+
+        public static function instance(): self {
+
+                if ( null === self::$instance ) {
+
+                        self::$instance = new self();
+
+                }
+
+
+
+                return self::$instance;
+
+        }
+
+
+
+        public static function activate(): void {
+
+                $settings = self::normalize_settings( get_option( self::OPTION_KEY, array() ) );
+
+                update_option( self::OPTION_KEY, $settings, false );
+
+        }
+
+
+
+        public function init(): void {
+
+                add_action( 'init', array( $this, 'register_content_types' ) );
+
+
+
+                if ( is_admin() ) {
+
+                        $this->admin = new WSM_Admin( $this );
+
+                }
+
+
+
+                $this->frontend = new WSM_Frontend( $this );
+
+        }
+
+
+
+        public function register_content_types(): void {
+
+                register_post_type(
+
+                        self::STORE_POST_TYPE,
+
+                        array(
+
+                                'labels'             => array(
+
+                                        'name'               => 'Магазины',
+
+                                        'singular_name'      => 'Магазин',
+
+                                        'add_new'            => 'Добавить магазин',
+
+                                        'add_new_item'       => 'Добавить магазин',
+
+                                        'edit_item'          => 'Редактировать магазин',
+
+                                        'new_item'           => 'Новый магазин',
+
+                                        'view_item'          => 'Просмотр магазина',
+
+                                        'search_items'       => 'Найти магазин',
+
+                                        'not_found'          => 'Магазины не найдены',
+
+                                        'not_found_in_trash' => 'Магазины не найдены в корзине',
+
+                                        'menu_name'          => 'Магазины',
+
+                                ),
+
+                                'public'             => false,
+
+                                'show_ui'            => true,
+
+                                'show_in_menu'       => true,
+
+                                'show_in_rest'       => false,
+
+                                'publicly_queryable' => false,
+
+                                'exclude_from_search' => true,
+
+                                'has_archive'        => false,
+
+                                'rewrite'            => false,
+
+                                'query_var'          => false,
+
+                                'menu_icon'          => 'dashicons-location-alt',
+
+                                'supports'           => array( 'title' ),
+
+                        )
+
+                );
+
+        }
+
+
+
+        public static function brand_slots(): array {
+
+                return array(
+
+                        array(
+
+                                'slug'  => 'brand-1',
+
+                                'label' => 'Бренд 1',
+
+                                'order' => 1,
+
+                        ),
+
+                        array(
+
+                                'slug'  => 'brand-2',
+
+                                'label' => 'Бренд 2',
+
+                                'order' => 2,
+
+                        ),
+
+                        array(
+
+                                'slug'  => 'brand-3',
+
+                                'label' => 'Бренд 3',
+
+                                'order' => 3,
+
+                        ),
+
+                );
+
+        }
+
+
+
+        public static function default_settings(): array {
+
+                $brands = array();
+
+
+
+                foreach ( self::brand_slots() as $slot ) {
+
+                        $brands[ $slot['slug'] ] = array(
+
+                                'name'        => $slot['label'],
+
+                                'logo_url'    => '',
+
+                                'default_url' => '',
+
+                        );
+
+                }
+
+
+
+                return array(
+
+                        'yandex_api_key' => '',
+
+                        'brands'         => $brands,
+
+                );
+
+        }
+
+
+
+        public static function normalize_settings( $settings ): array {
+
+                $settings = is_array( $settings ) ? $settings : array();
+
+                $merged   = self::default_settings();
+
+
+
+                $merged['yandex_api_key'] = isset( $settings['yandex_api_key'] ) ? sanitize_text_field( (string) $settings['yandex_api_key'] ) : '';
+
+
+
+                $brands = isset( $settings['brands'] ) && is_array( $settings['brands'] ) ? $settings['brands'] : array();
+
+
+
+                foreach ( self::brand_slots() as $slot ) {
+
+                        $slug    = (string) $slot['slug'];
+
+                        $raw     = isset( $brands[ $slug ] ) && is_array( $brands[ $slug ] ) ? $brands[ $slug ] : array();
+
+                        $name    = isset( $raw['name'] ) ? sanitize_text_field( (string) $raw['name'] ) : '';
+
+                        $logo    = isset( $raw['logo_url'] ) ? self::sanitize_http_url( (string) $raw['logo_url'] ) : '';
+
+                        $default = isset( $raw['default_url'] ) ? self::sanitize_http_url( (string) $raw['default_url'] ) : '';
+
+
+
+                        if ( '' === $name ) {
+
+                                $name = (string) $slot['label'];
+
+                        }
+
+
+
+                        $merged['brands'][ $slug ] = array(
+
+                                'name'        => $name,
+
+                                'logo_url'    => $logo,
+
+                                'default_url' => $default,
+
+                        );
+
+                }
+
+
+
+                return $merged;
+
+        }
+
+
+
+        public function get_settings(): array {
+
+                return self::normalize_settings( get_option( self::OPTION_KEY, array() ) );
+
+        }
+
+
+
+        public function get_brand_data(): array {
+
+                $settings = $this->get_settings();
+
+                $data     = array();
+
+
+
+                foreach ( self::brand_slots() as $slot ) {
+
+                        $slug          = (string) $slot['slug'];
+
+                        $brand_settings = isset( $settings['brands'][ $slug ] ) && is_array( $settings['brands'][ $slug ] ) ? $settings['brands'][ $slug ] : array();
+
+                        $name          = isset( $brand_settings['name'] ) ? trim( (string) $brand_settings['name'] ) : '';
+
+                        $logo_url      = isset( $brand_settings['logo_url'] ) ? self::sanitize_http_url( (string) $brand_settings['logo_url'] ) : '';
+
+                        $default_url   = isset( $brand_settings['default_url'] ) ? self::sanitize_http_url( (string) $brand_settings['default_url'] ) : '';
+
+
+
+                        if ( '' === $name ) {
+
+                                $name = (string) $slot['label'];
+
+                        }
+
+
+
+                        $data[] = array(
+
+                                'slug'         => $slug,
+
+                                'order'        => (int) $slot['order'],
+
+                                'name'         => $name,
+
+                                'logo_url'     => $logo_url,
+
+                                'default_url'  => $default_url,
+
+                                'has_logo'     => '' !== $logo_url,
+
+                                'has_url'      => '' !== $default_url,
+
+                        );
+
+                }
+
+
+
+                return $data;
+
+        }
+
+
+
+        public function get_brand_lookup(): array {
+
+                $lookup = array();
+
+
+
+                foreach ( $this->get_brand_data() as $brand ) {
+
+                        $lookup[ $brand['slug'] ] = $brand;
+
+                }
+
+
+
+                return $lookup;
+
+        }
+
+
+
+        public function get_brand_data_by_slug( string $slug ): array {
+
+                $slug = sanitize_key( $slug );
+
+
+
+                foreach ( $this->get_brand_data() as $brand ) {
+
+                        if ( $brand['slug'] === $slug ) {
+
+                                return $brand;
+
+                        }
+
+                }
+
+
+
+                return array();
+
+        }
+
+
+
+        public function get_brand_slugs(): array {
+
+                return wp_list_pluck( $this->get_brand_data(), 'slug' );
+
+        }
+
+
+
+        public function get_yandex_api_key(): string {
+
+                $settings = $this->get_settings();
+
+
+
+                return isset( $settings['yandex_api_key'] ) ? trim( (string) $settings['yandex_api_key'] ) : '';
+
+        }
+
+
+
+        public function get_geocoder() {
+
+                if ( null === $this->geocoder ) {
+
+                        $this->geocoder = new WSM_Geocoder( $this );
+
+                }
+
+
+
+                return $this->geocoder;
+
+        }
+
+
+
+        public function geocode_address( string $city, string $address ) {
+
+                return $this->get_geocoder()->geocode( $city, $address );
+
+        }
+
+
+
+        public function get_page_override_url( int $post_id ): string {
+
+                if ( $post_id <= 0 ) {
+
+                        return '';
+
+                }
+
+
+
+                return self::sanitize_http_url( (string) get_post_meta( $post_id, self::PAGE_META_OVERRIDE_URL, true ) );
+
+        }
+
+
+
+        public function get_context_override_url( int $post_id, string $shortcode_override = '' ): string {
+
+                $shortcode_override = self::sanitize_http_url( $shortcode_override );
+
+
+
+                if ( '' !== $shortcode_override ) {
+
+                        return $shortcode_override;
+
+                }
+
+
+
+                return $this->get_page_override_url( $post_id );
+
+        }
+
+
+
+        public function resolve_button_text( string $override_url = '' ): string {
+
+                return '' !== trim( $override_url ) ? 'Купить' : 'Перейти на сайт';
+
+        }
+
+
+
+        public function resolve_brand_button_url( string $brand_slug, string $override_url = '' ): string {
+
+                $override_url = self::sanitize_http_url( $override_url );
+
+                if ( '' !== $override_url ) {
+
+                        return $override_url;
+
+                }
+
+
+
+                $brand = $this->get_brand_data_by_slug( $brand_slug );
+
+
+
+                return isset( $brand['default_url'] ) ? (string) $brand['default_url'] : '';
+
+        }
+
+
+
+        public function build_cta_for_brand( string $brand_slug, string $override_url = '' ): array {
+
+                return array(
+
+                        'url'  => $this->resolve_brand_button_url( $brand_slug, $override_url ),
+
+                        'text' => $this->resolve_button_text( $override_url ),
+
+                );
+
+        }
+
+
+
+        public function normalize_city_slug( string $city ): string {
+
+                $city = trim( sanitize_text_field( $city ) );
+
+                if ( '' === $city ) {
+
+                        return '';
+
+                }
+
+
+
+                $slug = sanitize_title( $city );
+
+                if ( '' === $slug ) {
+
+                        $slug = sanitize_key( $city );
+
+                }
+
+
+
+                if ( '' === $slug ) {
+
+                        $slug = substr( md5( $city ), 0, 8 );
+
+                }
+
+
+
+                return $slug;
+
+        }
+
+
+
+        public function get_store_city( int $post_id ): string {
+
+                return trim( (string) get_post_meta( $post_id, self::STORE_META_CITY, true ) );
+
+        }
+
+
+
+        public function get_store_address( int $post_id ): string {
+
+                return trim( (string) get_post_meta( $post_id, self::STORE_META_ADDRESS, true ) );
+
+        }
+
+
+
+        public function get_store_coordinates( int $post_id ): array {
+
+                return array(
+
+                        'lat' => self::sanitize_float( get_post_meta( $post_id, self::STORE_META_LAT, true ) ),
+
+                        'lng' => self::sanitize_float( get_post_meta( $post_id, self::STORE_META_LNG, true ) ),
+
+                );
+
+        }
+
+
+
+        public function get_store_brand_slugs( int $post_id ): array {
+
+                return self::normalize_store_brand_slugs( get_post_meta( $post_id, self::STORE_META_BRAND_SLUGS, true ) );
+
+        }
+
+
+
+        public function get_store_validation_errors( int $post_id ): string {
+
+                return (string) get_post_meta( $post_id, self::STORE_META_VALIDATION_ERRORS, true );
+
+        }
+
+
+
+        public function get_store_geocode_error( int $post_id ): string {
+
+                return (string) get_post_meta( $post_id, self::STORE_META_GEOCODE_ERROR, true );
+
+        }
+
+
+
+        public function get_existing_city_names(): array {
+
+                $query = new WP_Query(
+
+                        array(
+
+                                'post_type'              => self::STORE_POST_TYPE,
+
+                                'post_status'            => 'publish',
+
+                                'posts_per_page'         => -1,
+
+                                'fields'                 => 'ids',
+
+                                'no_found_rows'          => true,
+
+                                'ignore_sticky_posts'    => true,
+
+                                'update_post_meta_cache' => false,
+
+                                'update_post_term_cache' => false,
+
+                        )
+
+                );
+
+
+
+                $cities = array();
+
+                if ( $query->have_posts() ) {
+
+                        foreach ( $query->posts as $post_id ) {
+
+                                $city = $this->get_store_city( (int) $post_id );
+
+                                if ( '' === $city ) {
+
+                                        continue;
+
+                                }
+
+
+
+                                $cities[ $this->normalize_city_slug( $city ) ] = $city;
+
+                        }
+
+                }
+
+
+
+                wp_reset_postdata();
+
+
+
+                uasort(
+
+                        $cities,
+
+                        static function ( $left, $right ) {
+
+                                return strcasecmp( $left, $right );
+
+                        }
+
+                );
+
+
+
+                return array_values( $cities );
+
+        }
+
+
+
+        public static function normalize_store_brand_slugs( $raw_slugs ): array {
+
+                if ( is_string( $raw_slugs ) ) {
+
+                        $raw_slugs = preg_split( '/[\s,]+/', $raw_slugs );
+
+                }
+
+
+
+                if ( ! is_array( $raw_slugs ) ) {
+
+                        $raw_slugs = array();
+
+                }
+
+
+
+                $allowed = array_flip( wp_list_pluck( self::brand_slots(), 'slug' ) );
+
+                $slugs   = array();
+
+
+
+                foreach ( $raw_slugs as $raw_slug ) {
+
+                        $slug = sanitize_key( (string) $raw_slug );
+
+                        if ( '' !== $slug && isset( $allowed[ $slug ] ) ) {
+
+                                $slugs[] = $slug;
+
+                        }
+
+                }
+
+
+
+                $ordered = array();
+
+                foreach ( self::brand_slots() as $slot ) {
+
+                        if ( in_array( $slot['slug'], $slugs, true ) ) {
+
+                                $ordered[] = $slot['slug'];
+
+                        }
+
+                }
+
+
+
+                return $ordered;
+
+        }
+
+
+
+        public function build_store_record( int $post_id ): ?array {
+
+                $title         = trim( (string) get_the_title( $post_id ) );
+
+                $city          = $this->get_store_city( $post_id );
+
+                $city_slug     = $this->normalize_city_slug( $city );
+
+                $address       = $this->get_store_address( $post_id );
+
+                $brand_slugs   = $this->get_store_brand_slugs( $post_id );
+
+                $coordinates   = $this->get_store_coordinates( $post_id );
+
+                $brand_lookup  = $this->get_brand_lookup();
+
+                $brand_records = array();
+
+                $lat           = self::sanitize_float( $coordinates['lat'] );
+
+                $lng           = self::sanitize_float( $coordinates['lng'] );
+
+
+
+                if ( '' === $title || '' === $city || '' === $city_slug || '' === $address || empty( $brand_slugs ) ) {
+
+                        return null;
+
+                }
+
+                if ( '' === $lat || '' === $lng ) {
+
+                        return null;
+
+                }
+
+
+
+                foreach ( $brand_slugs as $slug ) {
+
+                        if ( isset( $brand_lookup[ $slug ] ) ) {
+
+                                $brand_records[] = $brand_lookup[ $slug ];
+
+                        }
+
+                }
+
+
+
+                usort(
+
+                        $brand_records,
+
+                        static function ( $left, $right ) {
+
+                                if ( $left['order'] === $right['order'] ) {
+
+                                        return strcasecmp( $left['name'], $right['name'] );
+
+                                }
+
+
+
+                                return $left['order'] <=> $right['order'];
+
+                        }
+
+                );
+
+
+
+                if ( empty( $brand_records ) ) {
+
+                        return null;
+
+                }
+
+
+
+                return array(
+
+                        'id'          => $post_id,
+
+                        'title'       => $title,
+
+                        'address'     => $address,
+
+                        'city'        => array(
+
+                                'slug' => $city_slug,
+
+                                'name' => $city,
+
+                        ),
+
+                        'brand_slugs' => $brand_slugs,
+
+                        'brand_data'  => $brand_records,
+
+                        'lat'         => (float) $lat,
+
+                        'lng'         => (float) $lng,
+
+                );
+
+        }
+
+
+
+        public function get_valid_stores(): array {
+
+                $query = new WP_Query(
+
+                        array(
+
+                                'post_type'           => self::STORE_POST_TYPE,
+
+                                'post_status'         => 'publish',
+
+                                'posts_per_page'      => -1,
+
+                                'orderby'             => 'title',
+
+                                'order'               => 'ASC',
+
+                                'no_found_rows'       => true,
+
+                                'ignore_sticky_posts' => true,
+
+                                'update_post_meta_cache' => false,
+
+                                'update_post_term_cache' => false,
+
+                        )
+
+                );
+
+
+
+                $stores = array();
+
+                $cities = array();
+
+
+
+                if ( $query->have_posts() ) {
+
+                        foreach ( $query->posts as $post_id ) {
+
+                                $store = $this->build_store_record( (int) $post_id );
+
+                                if ( ! $store ) {
+
+                                        continue;
+
+                                }
+
+
+
+                                $stores[] = $store;
+
+                                $cities[ $store['city']['slug'] ] = $store['city'];
+
+                        }
+
+                }
+
+
+
+                wp_reset_postdata();
+
+
+
+                usort(
+
+                        $stores,
+
+                        static function ( $left, $right ) {
+
+                                return strcasecmp( $left['title'], $right['title'] );
+
+                        }
+
+                );
+
+
+
+                $cities = array_values( $cities );
+
+                usort(
+
+                        $cities,
+
+                        static function ( $left, $right ) {
+
+                                return strcasecmp( $left['name'], $right['name'] );
+
+                        }
+
+                );
+
+
+
+                return array(
+
+                        'stores' => $stores,
+
+                        'cities' => $cities,
+
+                );
+
+        }
+
+
+
+        public function determine_initial_brand_slug( array $brands, array $stores ): string {
+
+                if ( empty( $brands ) ) {
+
+                        return '';
+
+                }
+
+
+
+                $available_brand_slugs = array();
+
+                foreach ( $stores as $store ) {
+
+                        foreach ( (array) ( $store['brand_slugs'] ?? array() ) as $slug ) {
+
+                                $available_brand_slugs[ (string) $slug ] = true;
+
+                        }
+
+                }
+
+
+
+                foreach ( $brands as $brand ) {
+
+                        if ( isset( $available_brand_slugs[ $brand['slug'] ] ) ) {
+
+                                return (string) $brand['slug'];
+
+                        }
+
+                }
+
+
+
+                return (string) $brands[0]['slug'];
+
+        }
+
+
+
+        public function get_frontend_payload( string $override_url = '', int $context_post_id = 0 ): array {
+
+                $brands_result = $this->get_brand_data();
+
+                $stores_result = $this->get_valid_stores();
+
+                $stores        = $stores_result['stores'];
+
+                $cities        = $stores_result['cities'];
+
+                $override_url  = self::sanitize_http_url( $override_url );
+
+                $active_brand  = $this->determine_initial_brand_slug( $brands_result, $stores );
+
+                $map_center    = null;
+
+
+
+                if ( ! empty( $stores ) ) {
+
+                        $map_center = array(
+
+                                'lat' => (float) $stores[0]['lat'],
+
+                                'lng' => (float) $stores[0]['lng'],
+
+                        );
+
+                }
+
+
+
+                return array(
+
+                        'brands'          => $brands_result,
+
+                        'cities'          => $cities,
+
+                        'stores'          => $stores,
+
+                        'active_brand'    => $active_brand,
+
+                        'override_url'    => $override_url,
+
+                        'override_label'  => $this->resolve_button_text( $override_url ),
+
+                        'yandex_api_key'  => $this->get_yandex_api_key(),
+
+                        'map_center'      => $map_center,
+
+                        'context_post_id' => $context_post_id,
+
+                        'branding'        => array(
+
+                                'site_button_text' => 'Перейти на сайт',
+
+                                'buy_button_text'  => 'Купить',
+
+                        ),
+
+                        'strings'         => array(
+
+                                'all_cities'      => 'Все города',
+
+                                'no_stores'       => 'Нет магазинов для выбранных фильтров.',
+
+                                'no_valid_stores' => 'Пока нет магазинов с координатами для отображения.',
+
+                                'map_key_missing' => 'Укажите API-ключ Яндекс.Карт в настройках плагина.',
+
+                                'map_unavailable' => 'Карта временно недоступна.',
+
+                        ),
+
+                );
+
+        }
+
+
+
+        public static function sanitize_http_url( string $value ): string {
+
+                $value = trim( $value );
+
+                if ( '' === $value ) {
+
+                        return '';
+
+                }
+
+
+
+                $validated = function_exists( 'wp_http_validate_url' ) ? wp_http_validate_url( $value ) : filter_var( $value, FILTER_VALIDATE_URL );
+
+                if ( ! $validated ) {
+
+                        return '';
+
+                }
+
+
+
+                $scheme = wp_parse_url( $validated, PHP_URL_SCHEME );
+
+                if ( ! in_array( strtolower( (string) $scheme ), array( 'http', 'https' ), true ) ) {
+
+                        return '';
+
+                }
+
+
+
+                return esc_url_raw( $validated );
+
+        }
+
+
+
+        public static function sanitize_float( $value ): string {
+
+                $value = is_string( $value ) ? trim( str_replace( ',', '.', $value ) ) : (string) $value;
+
+                if ( '' === $value || ! is_numeric( $value ) ) {
+
+                        return '';
+
+                }
+
+
+
+                return (string) (float) $value;
+
+        }
+
 }
