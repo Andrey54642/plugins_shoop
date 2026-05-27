@@ -775,14 +775,31 @@ class WSM_Plugin {
                 $lng           = self::sanitize_float( $coordinates['lng'] );
 
 
+                // Debug: log raw data for troubleshooting
+                error_log( sprintf(
+                    'WSM Store #%d: title="%s", city="%s" (slug="%s"), address="%s", brands=%s, lat="%s", lng="%s"',
+                    $post_id,
+                    $title,
+                    $city,
+                    $city_slug,
+                    $address,
+                    json_encode( $brand_slugs ),
+                    $lat,
+                    $lng
+                ) );
 
-                if ( '' === $title || '' === $city || '' === $city_slug || '' === $address || empty( $brand_slugs ) ) {
+
+                if ( '' === $title || '' === $city || '' === $address || empty( $brand_slugs ) ) {
+
+                        error_log( sprintf( 'WSM Store #%d rejected: missing required fields', $post_id ) );
 
                         return null;
 
                 }
 
                 if ( '' === $lat || '' === $lng ) {
+
+                        error_log( sprintf( 'WSM Store #%d rejected: missing coordinates (lat="%s", lng="%s")', $post_id, $lat, $lng ) );
 
                         return null;
 
